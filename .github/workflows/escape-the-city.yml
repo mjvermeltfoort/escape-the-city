@@ -24,7 +24,10 @@ jobs:
       run:
         working-directory: de-moerasdraak
     runs-on: ubuntu-latest
+    outputs:
+      pages_artifact: ${{ env.PAGES_ARTIFACT_NAME }}
     env:
+      PAGES_ARTIFACT_NAME: github-pages-${{ github.run_attempt }}
       VITE_SUPABASE_URL: ${{ vars.SUPABASE_URL }}
       VITE_SUPABASE_ANON_KEY: ${{ vars.SUPABASE_PUBLISHABLE_KEY }}
     steps:
@@ -47,6 +50,7 @@ jobs:
           cp -R dist/. ../_site/de-moerasdraak/
       - uses: actions/upload-pages-artifact@v5
         with:
+          name: ${{ env.PAGES_ARTIFACT_NAME }}
           path: _site
   deploy:
     needs: build
@@ -57,3 +61,5 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@v5
+        with:
+          artifact_name: ${{ needs.build.outputs.pages_artifact }}
