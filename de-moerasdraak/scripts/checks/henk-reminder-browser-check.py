@@ -6,7 +6,7 @@ from playwright.sync_api import expect
 
 
 def check_henk_reminders(page, origin, diagnostics):
-    root = Path(__file__).resolve().parents[2] / 'escape-the-city'
+    root = Path(__file__).resolve().parents[2]
     clips = json.loads((root / 'src/features/audio/hintHenkClips.json').read_text())
     ids = [key[:-3] for key in clips if key.endswith(':h1')]
     bonus_ids = [key for key in ids if key.startswith('bonus:')]
