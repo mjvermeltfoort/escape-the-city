@@ -1,0 +1,344 @@
+import { HenkWrongAnswer } from '../components/HenkWrongAnswer';
+import { formatAnswerWait, type AnswerAttemptResult } from '../features/game/answerCooldown';
+import { useAnswerCooldown } from '../features/game/useAnswerCooldown';
+import { useEffect, useRef, useState } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
+import type { GamePack } from '../features/game/gameTypes';
+import { useGame } from '../app/gameContext';
+import { canAccessChallenge, canViewResult, hasLocationUnlock, isFinaleLocationRevealed, locationById } from '../features/game/gameState';
+import { isBonusLocation } from '../features/game/gameTypes';
+import { GameIcon, PageShell } from '../components/GameUi';
+import { HintHenkHint } from '../components/HintHenkHint';
+import { AudioPlayer } from '../components/AudioPlayer';
+import { BellChallengeAudio } from '../components/BellChallengeAudio';
+import { BoschMonsterPuzzle } from '../components/BoschMonsterPuzzle';
+import { narrationAudio } from '../features/audio/audioConfig';
+import { audioTranscripts } from '../features/audio/audioTranscripts';
+
+const compositeCategoryLabels: Record<string, string> = {
+  head: 'Hoofd',
+  body: 'Lijf',
+  object: 'Voorwerp'
+};
+
+const compositeOptionLabels: Record<string, Record<string, string>> = {
+  head: { Horn: 'Hoorn' }
+};
+
+function labelForCompositeCategory(category: string) {
+  return compositeCategoryLabels[category] ?? category;
+}
+
+function labelForCompositeOption(category: string, option: string) {
+  return compositeOptionLabels[category]?.[option] ?? option;
+}
+
+export function ChallengePage({ pack }: { pack: GamePack }) {
+  const { stopId } = useParams();
+  const navigate = useNavigate();
+  const { activeTeam, progress, attemptAnswer, useHint, completeFinale } = useGame();
+  const stop = stopId ? locationById(pack, stopId) : null;
+  const [choice, setChoice] = useState('');
+  const [code, setCode] = useState('');
+  const [list, setList] = useState<string[]>(stop?.challenge.kind === 'reorder' ? [...stop.challenge.items] : []);
+  const [composite, setComposite] = useState<Record<string, string>>({});
+  const [boschBookOpen, setBoschBookOpen] = useState(false);
+  const [lensLeft, setLensLeft] = useState(0);
+  const [lensRight, setLensRight] = useState(0);
+  const [lensInteracted, setLensInteracted] = useState(false);
+  const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [attemptFeedback, setAttemptFeedback] = useState<AnswerAttemptResult | null>(null);
+  const [wrongAnswerReplayRequest, setWrongAnswerReplayRequest] = useState(0);
+  const submitting = useRef(false);
+  const submissionId = useRef(0);
+  const stopProgress = stop ? progress?.stopProgress[stop.id] : undefined;
+  const serverDeadlineIsLatest = (Date.parse(stopProgress?.retryAvailableAt ?? '') || 0) >= (Date.parse(attemptFeedback?.retryAvailableAt ?? '') || 0);
+  const retryAvailableAt = serverDeadlineIsLatest ? stopProgress?.retryAvailableAt : attemptFeedback?.retryAvailableAt;
+  const wrongPenalty = serverDeadlineIsLatest ? stopProgress?.lastWrongAnswerPenalty : attemptFeedback?.penaltyPoints;
+  const waitSeconds = useAnswerCooldown(retryAvailableAt, progress?.serverTimeOffsetMs ?? attemptFeedback?.serverTimeOffsetMs);
+  const [hintOpen, setHintOpen] = useState(false);
+  const [replayHint, setReplayHint] = useState(false);
+  const activeStopId = useRef(stopId);
+
+  activeStopId.current = stopId;
+
+  useEffect(() => {
+    setChoice('');
+    setCode('');
+    setList(stop?.challenge.kind === 'reorder' ? [...stop.challenge.items] : []);
+    setComposite({});
+    setBoschBookOpen(false);
+    setLensLeft(0);
+    setLensRight(0);
+    setLensInteracted(false);
+    setMessage('');
+    setBusy(false);
+    submitting.current = false;
+    submissionId.current += 1;
+    setAttemptFeedback(null);
+    setWrongAnswerReplayRequest(0);
+    setHintOpen(false);
+    setReplayHint(false);
+  }, [stopId, stop]);
+
+  if (!stop) return <PageShell title="Opdracht" backTo="/route"><p>Opdracht niet gevonden.</p></PageShell>;
+
+  const currentStop = stop;
+  if (currentStop.isFinal && (!progress || !isFinaleLocationRevealed(progress, pack))) {
+    return (
+      <PageShell title="Finale vergrendeld" backTo="/route" navigation={false}>
+        <section className="card stack center">
+          <GameIcon name="lock" size={32} />
+          <h1>Eindlocatie nog verborgen</h1>
+          <p>Voltooi eerst alle eerdere opdrachten.</p>
+        </section>
+      </PageShell>
+    );
+  }
+  if (!progress || !canAccessChallenge(progress, currentStop.id)) {
+    return (
+      <PageShell title="Locatie controleren" backTo={`/stop/${currentStop.id}`}>
+        <section className="card stack center">
+          <GameIcon name="location" size={32} />
+          <h1>Controleer eerst jullie locatie</h1>
+          <p>Ontgrendel deze opdracht met GPS of de handmatige locatiecontrole.</p>
+        </section>
+      </PageShell>
+    );
+  }
+  const hintCount = progress?.stopProgress[currentStop.id]?.hintsUsed ?? 0;
+  const activeHint = currentStop.hints[hintCount];
+  const revealedHint = hintCount > 0 ? currentStop.hints[Math.min(hintCount, currentStop.hints.length) - 1] : null;
+  const isFinal = currentStop.isFinal;
+  const penalty = pack.scoring.hintPenalty[hintCount] ?? pack.scoring.hintPenalty.at(-1) ?? 0;
+  const openStops = pack.stops.filter((stopItem) => progress.stopProgress[stopItem.id]?.state !== 'completed').length;
+
+  const gameCompleted = progress ? canViewResult(progress, pack) : false;
+  const showParchment = !gameCompleted && (progress ? (hasLocationUnlock(progress, currentStop.id) || canAccessChallenge(progress, currentStop.id)) : false);
+
+  const canSubmit = (() => {
+    if (currentStop.challenge.kind === 'choice') return choice.length > 0;
+    if (currentStop.challenge.kind === 'code') return code.length === currentStop.challenge.answerLength;
+    if (currentStop.challenge.kind === 'reorder') return list.length === currentStop.challenge.correctOrder.length;
+    if (currentStop.challenge.kind === 'composite') return (currentStop.id !== 'bosch-wezen' || boschBookOpen) && Object.keys(composite).length === Object.keys(currentStop.challenge.categories).length;
+    if (currentStop.challenge.kind === 'lens') return lensInteracted;
+    return false;
+  })();
+
+  async function submit() {
+    if (submitting.current || waitSeconds > 0 || !canSubmit) return;
+    submitting.current = true;
+    const requestId = ++submissionId.current;
+    const submittedStopId = currentStop.id;
+    setBusy(true);
+    try {
+      const answer = currentStop.challenge.kind === 'choice'
+        ? choice
+        : currentStop.challenge.kind === 'code'
+          ? code
+          : currentStop.challenge.kind === 'reorder'
+            ? list
+            : currentStop.challenge.kind === 'composite'
+              ? composite
+              : lensLeft === 2 && lensRight === 3
+                ? currentStop.challenge.correctAnswer
+                : '';
+      const result = await attemptAnswer(currentStop.id, currentStop.challenge, answer);
+      if (activeStopId.current !== submittedStopId || submissionId.current !== requestId) return;
+      setMessage(result.message);
+      setAttemptFeedback(result);
+      if (result.correct) {
+        if (isFinal) {
+          await completeFinale();
+          navigate('/resultaat');
+        } else {
+          navigate(`/stop/${currentStop.id}`);
+        }
+      }
+    } catch (error) {
+      if (activeStopId.current === submittedStopId && submissionId.current === requestId) setMessage(error instanceof Error ? error.message : 'Het antwoord kon niet worden gecontroleerd. Probeer het opnieuw.');
+    } finally {
+      if (activeStopId.current === submittedStopId && submissionId.current === requestId) { submitting.current = false; setBusy(false); }
+    }
+  }
+
+  function updateCode(rawValue: string) {
+    if (currentStop.challenge.kind !== 'code') return;
+    const value = currentStop.challenge.keyboard === 'numeric'
+      ? rawValue.replace(/\D/g, '')
+      : rawValue;
+    setCode(value.slice(0, currentStop.challenge.answerLength));
+    setMessage('');
+  }
+
+  return (
+    <PageShell title="Opdracht" backTo={`/stop/${currentStop.id}`} navigation={false}>
+      <p className="eyebrow center">{isBonusLocation(currentStop) ? 'Verborgen Schub' : `${currentStop.order} / ${pack.stops.length}`}</p>
+      <p className="center muted small">Nog {openStops} opdrachten open · hints kosten {penalty} punten</p>
+      {showParchment ? (
+        <section className={`parchment-card challenge-card stack stack--large${currentStop.id === 'bosch-wezen' && boschBookOpen ? ' bosch-challenge' : ''}`}>
+        {isFinal ? (
+          <AudioPlayer
+            source={narrationAudio.finale}
+            title="Luister naar de finale"
+            transcript={audioTranscripts.finale}
+          />
+        ) : null}
+        <div>
+          <h1 className={currentStop.title.length >= 18 ? 'challenge-card__title--long' : undefined}>{currentStop.title}</h1>
+          <p>{currentStop.challenge.prompt}</p>
+        </div>
+
+        {currentStop.id !== 'bosch-wezen' && currentStop.id !== 'bonus:citadel' ? <div className="audio-panel" aria-label="Opdrachtillustratie niet beschikbaar">
+          <span className="audio-icon"><GameIcon name="scroll" /></span>
+          <div>
+            <strong>Bekijk de plek</strong>
+            <p>Gebruik details op locatie om deze opdracht op te lossen.</p>
+          </div>
+        </div> : null}
+
+        {currentStop.id === 'sint-jan' ? <BellChallengeAudio /> : null}
+
+        {currentStop.challenge.kind === 'choice' ? (
+          <fieldset className="stack">
+            <legend className="eyebrow">Kies één antwoord</legend>
+            {currentStop.challenge.options.map((option) => (
+              <label key={option.id} className="choice-option">
+                <input type="radio" name="choice" value={option.id} checked={choice === option.id} onChange={() => { setChoice(option.id); setMessage(''); }} />
+                <span>{option.label}</span>
+              </label>
+            ))}
+          </fieldset>
+        ) : null}
+
+        {currentStop.challenge.kind === 'code' ? (
+          <label className="field">
+            <span>Voer de code in</span>
+            <input
+              className="code-input"
+              value={code}
+              maxLength={currentStop.challenge.answerLength}
+              onChange={(event) => updateCode(event.target.value)}
+              inputMode={currentStop.challenge.keyboard === 'numeric' ? 'numeric' : 'text'}
+              autoComplete="off"
+              aria-describedby={`code-answer-help${message ? ' answer-feedback' : ''}`}
+            />
+            <small id="code-answer-help">Voer precies {currentStop.challenge.answerLength} cijfers in.</small>
+          </label>
+        ) : null}
+
+        {currentStop.challenge.kind === 'reorder' ? (
+          <div className="stack">
+            <p className="eyebrow">Zet in juiste volgorde</p>
+            {list.map((item, index) => {
+              const move = (direction: -1 | 1) => {
+                setMessage('');
+                setList((current) => {
+                  const copy = [...current];
+                  const nextIndex = Math.max(0, Math.min(copy.length - 1, index + direction));
+                  copy.splice(index, 1);
+                  copy.splice(nextIndex, 0, item);
+                  return copy;
+                });
+              };
+              return (
+                <div key={item} className="reorder-item">
+                  <span>{index + 1}. {item}</span>
+                  <button className="button" type="button" aria-label={`${item} omhoog`} disabled={index === 0} onClick={() => move(-1)}>↑</button>
+                  <button className="button" type="button" aria-label={`${item} omlaag`} disabled={index === list.length - 1} onClick={() => move(1)}>↓</button>
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
+
+        {currentStop.challenge.kind === 'composite' && currentStop.id === 'bosch-wezen' ? (
+          <BoschMonsterPuzzle
+            unlocked={boschBookOpen}
+            onUnlock={() => { setBoschBookOpen(true); setMessage(''); }}
+            selection={composite}
+            onSelect={(slot, value) => {
+              setComposite((current) => ({ ...current, [slot]: value }));
+              setMessage('');
+            }}
+          />
+        ) : null}
+
+        {currentStop.challenge.kind === 'composite' && currentStop.id !== 'bosch-wezen' ? (
+          <div className="stack">
+            {Object.entries(currentStop.challenge.categories).map(([category, options]) => (
+              <label key={category} className="field">
+                <span>{labelForCompositeCategory(category)}</span>
+                <select
+                  value={composite[category] ?? ''}
+                  aria-label={labelForCompositeCategory(category)}
+                  onChange={(event) => {
+                    setComposite((current) => ({ ...current, [category]: event.target.value }));
+                    setMessage('');
+                  }}
+                >
+                  <option value="">Kies {labelForCompositeCategory(category).toLowerCase()}</option>
+                  {options.map((option) => <option key={option} value={option}>{labelForCompositeOption(category, option)}</option>)}
+                </select>
+              </label>
+            ))}
+          </div>
+        ) : null}
+
+        {currentStop.challenge.kind === 'lens' ? (
+          <div className="lens-puzzle stack" aria-label="Papenbril-lenzenpuzzel">
+            <p>Stel beide lenzen af tot de punten van de vesting samenkomen.</p>
+            <div className="lens-puzzle__lenses" aria-hidden="true"><span style={{ transform: `rotate(${lensLeft * 72}deg)` }}>◒</span><span style={{ transform: `rotate(${lensRight * 72}deg)` }}>◓</span></div>
+            <div className="row"><button className="button secondary" type="button" onClick={() => { setLensLeft((value) => (value + 1) % 5); setLensInteracted(true); setMessage(''); }}>Linkerlens draaien</button><button className="button secondary" type="button" onClick={() => { setLensRight((value) => (value + 1) % 5); setLensInteracted(true); setMessage(''); }}>Rechterlens draaien</button></div>
+            <button className="button ghost" type="button" onClick={() => { setLensLeft(0); setLensRight(0); setLensInteracted(true); setMessage(''); }}>Lenzen resetten</button>
+          </div>
+        ) : null}
+
+        {revealedHint ? <div className="revealed-hint"><p><strong>Hint Henk:</strong> {revealedHint.text}</p>
+          <button type="button" className="text-link" onClick={() => { setReplayHint(true); setHintOpen(true); }}>Hint Henk opnieuw bekijken</button>
+        </div> : null}
+        <HenkWrongAnswer key={currentStop.id} teamId={activeTeam?.id ?? progress.teamId} stopId={currentStop.id} deadline={retryAvailableAt} seconds={waitSeconds} penalty={wrongPenalty} reopenRequest={wrongAnswerReplayRequest} />
+        {message ? <p className="feedback" id="answer-feedback" role="alert">{message}</p> : null}
+
+        <div className="stack">
+          {currentStop.id !== 'bosch-wezen' || boschBookOpen ? (
+            <button
+              className="button primary"
+              type="button"
+              disabled={busy || (waitSeconds === 0 && !canSubmit)}
+              title={waitSeconds > 0 ? 'Bekijk Henks foutmelding' : undefined}
+              aria-label={waitSeconds > 0 ? `Nieuwe poging over ${formatAnswerWait(waitSeconds)}. Bekijk Henks foutmelding.` : undefined}
+              onClick={() => {
+                if (waitSeconds > 0) {
+                  setWrongAnswerReplayRequest((value) => value + 1);
+                } else {
+                  void submit();
+                }
+              }}
+            >
+              {waitSeconds > 0 ? `Nieuwe poging over ${formatAnswerWait(waitSeconds)}` : busy ? 'Antwoord controleren…' : currentStop.id === 'bosch-wezen' ? 'Wek het monster tot leven' : 'Controleer antwoord'}
+            </button>
+          ) : null}
+          {activeHint ? (
+            <button className="button secondary" type="button" onClick={() => { setReplayHint(false); setHintOpen(true); }}>
+              <GameIcon name="lightbulb" size={18} /> Hint gebruiken · −{penalty} punten
+            </button>
+          ) : <p className="center muted small">Geen extra hints beschikbaar.</p>}
+        </div>
+      </section>
+      ) : null}
+
+      {hintOpen ? <HintHenkHint
+        key={currentStop.id}
+        open={hintOpen}
+        stopId={currentStop.id}
+        hint={replayHint ? revealedHint ?? undefined : activeHint}
+        replay={replayHint}
+        penalty={penalty}
+        onClose={() => setHintOpen(false)}
+        onConfirm={(hintId) => useHint(currentStop.id, hintId)}
+      /> : null}
+    </PageShell>
+  );
+}

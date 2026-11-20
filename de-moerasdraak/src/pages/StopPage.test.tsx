@@ -1,0 +1,682 @@
+// @vitest-environment jsdom
+import { act } from 'react';
+import { createRoot } from 'react-dom/client';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createInitialProgress, hasLocationUnlock, type GameProgress } from '../features/game/gameState';
+import { gamePack } from '../game-data/moerasdraak/game';
+import type { TeamLocation } from '../lib/supabase/sync';
+import type { LocationErrorResult, LocationResult } from '../features/location/provider';
+
+const createProgress = () => {
+  const value = createInitialProgress('team-1', gamePack);
+  value.stopProgress.drakenfontein.state = 'completed';
+  value.stopProgress.drakenfontein.unlockMethod = 'gps';
+  value.stopProgress['bonus:bolwerk-sint-jan'].state = 'completed';
+  value.stopProgress['bonus:bolwerk-sint-jan'].unlockMethod = 'gps';
+  return value;
+};
+
+const selectBonus = vi.fn().mockResolvedValue(undefined);
+
+const setTeamLocation = (overrides: Partial<TeamLocation> = {}): TeamLocation => ({
+  sourceSessionId: 'session-1',
+  capturedAt: '2026-10-10T18:17:00.000Z',
+  selectedAt: '2026-10-10T18:17:00.000Z',
+  isCurrent: true,
+  latitude: 51.69,
+  longitude: 5.3,
+  accuracyM: 12,
+  ...overrides
+});
+
+let gameState = {
+  progress: createProgress(),
+  startStop: vi.fn(),
+  teamLocation: null as TeamLocation | null,
+  deviceLocation: null as LocationResult | null,
+  activeGameRun: null as { status: 'active' | 'completed'; gameId: string } | null,
+  locationError: null as LocationErrorResult | null,
+  currentObservation: null,
+  observationStatus: 'unavailable' as const,
+  submitObservation: vi.fn(),
+  selectBackupObservation: vi.fn(),
+  selectBonus,
+  submitBonusObservation: vi.fn(),
+  submitSimulatedLocation: vi.fn()
+};
+
+vi.mock('../app/gameContext', () => ({
+  useGame: () => gameState
+}));
+
+vi.mock('../components/GameUi', () => ({
+  PageShell: ({ children, title }: { children: React.ReactNode; title: string }) => <main><header>{title}</header>{children}</main>,
+  GameIcon: () => <span aria-hidden="true" />
+}));
+vi.mock('../components/AudioPlayer', () => ({
+  AudioPlayer: ({ source, title, transcript }: { source: string; title: string; transcript: string }) => (
+    <section aria-label={title} data-testid="stop-audio-player" data-audio-source={source}><p>{transcript}</p></section>
+  )
+}));
+vi.mock('../features/location/ActiveStopIndicator', () => ({
+  ActiveStopIndicator: ({ location, progress, showOpenButton, onOpenChallenge }: { location: LocationResult | null; progress: GameProgress | null; showOpenButton?: boolean; onOpenChallenge?: () => void }) => (
+    <>
+      <div data-testid="active-stop-gps">{location ? `${location.latitude},${location.longitude}` : 'Locatie zoeken…'}</div>
+      {showOpenButton && progress && hasLocationUnlock(progress, progress.currentStopId)
+        ? <button type="button" onClick={onOpenChallenge}>Opdracht openen</button>
+        : null}
+    </>
+  )
+}));
+
+import { StopPage } from './StopPage';
+
+describe('StopPage completion copy', () => {
+  const container = document.createElement('div');
+  const root = createRoot(container);
+
+  beforeAll(() => {
+    (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    Object.defineProperty(window, 'innerWidth', { value: 390, writable: true });
+  });
+
+  beforeEach(() => {
+    gameState = {
+      ...gameState,
+      progress: createProgress(),
+      startStop: vi.fn(),
+      teamLocation: null as TeamLocation | null,
+      deviceLocation: null as LocationResult | null,
+      activeGameRun: null,
+      locationError: null as LocationErrorResult | null,
+      currentObservation: null,
+      observationStatus: 'unavailable',
+      submitObservation: vi.fn(),
+      selectBackupObservation: vi.fn(),
+      selectBonus,
+      submitBonusObservation: vi.fn(),
+      submitSimulatedLocation: vi.fn()
+    };
+  });
+
+  afterAll(() => {
+    act(() => root.unmount());
+    (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+  });
+
+  it('hides story and location after a completed main stop', async () => {
+    await act(async () => root.render(
+      <MemoryRouter initialEntries={['/stop/drakenfontein']}>
+        <Routes><Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} /></Routes>
+      </MemoryRouter>
+    ));
+
+    expect(container.querySelector('header')?.textContent).toBe('Herinnering');
+    const links = Array.from(container.querySelectorAll('a.button')).map((link) => ({ href: link.getAttribute('href'), text: link.textContent }));
+
+    expect(container.textContent).toContain('Herinnering hersteld');
+    expect(links).toHaveLength(1);
+    expect(links[0]).toMatchObject({ href: '/route', text: 'Bekijk volgende routepunt op kaart' });
+    expect(container.textContent).not.toContain('Vind de locatie');
+    expect(container.textContent).not.toContain('Opdracht 1 van 7');
+    expect(container.textContent).not.toContain('GPS-devsimulator');
+  });
+
+  it('reveals the history of the Marktstroom only after Waterpoort is completed', async () => {
+    const unfinished = createProgress();
+    unfinished.currentStopId = 'binnendieze';
+    unfinished.stopProgress.binnendieze.state = 'available';
+    gameState = { ...gameState, progress: unfinished };
+    const page = (key: string) => (
+      <MemoryRouter key={key} initialEntries={['/stop/binnendieze']}>
+        <Routes><Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} /></Routes>
+      </MemoryRouter>
+    );
+
+    await act(async () => root.render(page('waterpoort-unfinished')));
+    expect(container.querySelector('[aria-label="Uitleg bij het juiste antwoord"]')).toBeNull();
+    expect(container.textContent).not.toContain('Deze waterloop werd tussen 1962 en 1966 gedempt');
+
+    const completed = createProgress();
+    completed.stopProgress.binnendieze.state = 'completed';
+    completed.stopProgress.binnendieze.unlockMethod = 'gps';
+    gameState = { ...gameState, progress: completed };
+    await act(async () => root.render(page('waterpoort-completed')));
+
+    expect(container.textContent).toContain('Herinnering hersteld');
+    const explanation = container.querySelector('[aria-label="Uitleg bij het juiste antwoord"]');
+    expect(explanation?.textContent).toContain('Het verhaal achter Waterpoort');
+    expect(explanation?.textContent).toContain('Marktstroom');
+    expect(explanation?.textContent).toContain('1962 en 1966');
+    expect(container.querySelector('a[href="/route"]')?.textContent).toContain('Bekijk volgende routepunt op kaart');
+  });
+
+  it('uses route mode for a completed middle stop', async () => {
+    const progress = createProgress();
+    progress.stopProgress['sint-jan'].state = 'completed';
+    progress.stopProgress['sint-jan'].unlockMethod = 'gps';
+    gameState = { ...gameState, progress };
+
+    await act(async () => root.render(
+      <MemoryRouter key="mid" initialEntries={['/stop/sint-jan']}>
+        <Routes><Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} /></Routes>
+      </MemoryRouter>
+    ));
+
+    const links = Array.from(container.querySelectorAll('a.button')).map((link) => ({ href: link.getAttribute('href'), text: link.textContent }));
+
+    expect(container.textContent).toContain('Bekijk volgende routepunt op kaart');
+    expect(links).toHaveLength(1);
+    expect(links[0]).toMatchObject({ href: '/route', text: 'Bekijk volgende routepunt op kaart' });
+    expect(container.textContent).not.toContain('Volgende routepunt');
+    expect(container.textContent).not.toContain('Vind de locatie');
+  });
+
+  it('restores the Bosch story narration and its full transcript on the stop page', async () => {
+    const progress = createProgress();
+    progress.currentStopId = 'bosch-wezen';
+    progress.stopProgress['bosch-wezen'].state = 'arrived';
+    progress.stopProgress['bosch-wezen'].unlockMethod = 'gps';
+    gameState = { ...gameState, progress };
+
+    await act(async () => root.render(
+      <MemoryRouter key="bosch-story-audio" initialEntries={['/stop/bosch-wezen']}>
+        <Routes><Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} /></Routes>
+      </MemoryRouter>
+    ));
+
+    expect(container.textContent).toContain('Het Monster van Bosch');
+    expect(container.querySelector('.parchment-card h1')?.textContent).toBe('Het Monster van Bosch');
+    expect(container.textContent).toContain('In de wereld van Jheronimus Bosch is niets wat het lijkt.');
+    const teaser = container.querySelector('.parchment-card > p:not(.eyebrow):not(.parchment-instruction)')?.textContent ?? '';
+    expect(teaser).not.toMatch(/schetsboek|sokkel|twee aanwijzingen|penseel|palet|1516|boomman/i);
+    const player = container.querySelector('[data-testid="stop-audio-player"]');
+    expect(player).not.toBeNull();
+    expect(player?.getAttribute('aria-label')).toBe('Luister naar het verhaal');
+    expect(player?.getAttribute('data-audio-source')).toContain('/audio/04-jheronimus-bosch.mp3');
+    expect(player?.textContent).toContain('Hier groeide een jongen op die de wereld anders zag dan ieder ander.');
+    expect(player?.textContent).toContain('Waar anderen een gevel, regenpijp of toren zagen');
+    expect(player?.textContent).toContain('Bouw het wezen dat alleen jullie kunnen zien.');
+    expect(player?.textContent).not.toContain('Voor jullie staat Jheronimus Bosch');
+  });
+
+  it('reveals the animated Bosch monster and history only after completing the statue puzzle', async () => {
+    const initial = createProgress();
+    initial.currentStopId = 'bosch-wezen';
+    initial.stopProgress['bosch-wezen'].state = 'available';
+    gameState = { ...gameState, progress: initial };
+    const page = (key: string) => (
+      <MemoryRouter key={key} initialEntries={['/stop/bosch-wezen']}>
+        <Routes><Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} /></Routes>
+      </MemoryRouter>
+    );
+    await act(async () => root.render(page('bosch-unfinished')));
+    expect(container.querySelector('.bosch-monster-completed')).toBeNull();
+    expect(container.textContent).not.toContain('Het standbeeld op de Markt is gemaakt');
+
+    const completed = createProgress();
+    completed.stopProgress['bosch-wezen'].state = 'completed';
+    completed.stopProgress['bosch-wezen'].unlockMethod = 'gps';
+    gameState = { ...gameState, progress: completed };
+    await act(async () => root.render(page('bosch-completed')));
+    expect(container.textContent).toContain('Jullie Boomman is tot leven gewekt!');
+    expect(container.querySelector('.bosch-monster-completed .bosch-art--alive')).not.toBeNull();
+    expect(container.querySelector('[aria-label="Uitleg bij het juiste antwoord"]')?.textContent).toContain('August Falise');
+    expect(container.querySelector('a[href="/route"]')?.textContent).toContain('Bekijk volgende routepunt op kaart');
+  });
+
+  it('shows the result action without route duplication after the finale', async () => {
+    const finaleProgress = createProgress();
+    for (const stop of gamePack.stops) {
+      finaleProgress.stopProgress[stop.id].state = 'completed';
+      finaleProgress.stopProgress[stop.id].unlockMethod = 'gps';
+    }
+    gameState = { ...gameState, progress: finaleProgress };
+
+    await act(async () => root.render(
+      <MemoryRouter key="finale" initialEntries={['/stop/bossche-brouwers']}>
+        <Routes><Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} /></Routes>
+      </MemoryRouter>
+    ));
+
+    const links = Array.from(container.querySelectorAll('a.button')).map((link) => ({ href: link.getAttribute('href'), text: link.textContent }));
+
+    expect(container.textContent).toContain('Bekijk resultaat');
+    expect(links).toHaveLength(1);
+    expect(links[0]).toMatchObject({ href: '/resultaat', text: 'Bekijk resultaat' });
+    expect(container.textContent).not.toContain('Bekijk routekaart');
+    expect(container.textContent).not.toContain('Volgende routepunt');
+  });
+
+  it('shows intro text once without audio and preserves audio transcript content', async () => {
+    gameState = { ...gameState, progress: createProgress() };
+
+    await act(async () => root.render(
+      <MemoryRouter key="bonus-text" initialEntries={['/stop/bonus:halve-peer']}>
+        <Routes><Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} /></Routes>
+      </MemoryRouter>
+    ));
+
+    expect(container.textContent).toContain('Zoek een belangrijk man die maar voor de helft aanwezig is, boven de Binnendieze.');
+    expect(container.textContent?.split('Zoek een belangrijk man die maar voor de helft aanwezig is, boven de Binnendieze.').length).toBe(2);
+    expect(container.textContent).not.toContain('Luister naar het verhaal');
+  });
+
+  it('reveals the true story behind De Halve Peer only after a correct answer', async () => {
+    const unfinished = createProgress();
+    unfinished.stopProgress['bonus:halve-peer'].state = 'available';
+    gameState = { ...gameState, progress: unfinished };
+
+    const page = (key: string) => (
+      <MemoryRouter key={key} initialEntries={['/stop/bonus:halve-peer']}>
+        <Routes><Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} /></Routes>
+      </MemoryRouter>
+    );
+
+    await act(async () => root.render(page('halve-peer-unfinished')));
+    expect(container.querySelector('[aria-label="Uitleg bij het juiste antwoord"]')).toBeNull();
+    expect(container.textContent).not.toContain('Frans Vennix, die jarenlang');
+
+    const completed = createProgress();
+    completed.stopProgress['bonus:halve-peer'].state = 'completed';
+    completed.stopProgress['bonus:halve-peer'].unlockMethod = 'gps';
+    gameState = { ...gameState, progress: completed };
+    await act(async () => root.render(page('halve-peer-completed')));
+
+    expect(container.textContent).toContain('Drakenschub gevonden');
+    expect(container.textContent).toContain('Narrenschub');
+    const explanation = container.querySelector('[aria-label="Uitleg bij het juiste antwoord"]');
+    expect(explanation?.textContent).toContain('Het verhaal achter De Halve Peer');
+    expect(explanation?.textContent).toContain('Frans Vennix');
+    expect(explanation?.textContent).toContain('Oeteldonksche Club');
+    expect(explanation?.textContent).toContain('1988');
+    expect(container.querySelector('a[href="/route"]')?.textContent).toContain('Terug naar hoofdroute');
+  });
+
+  it('reveals De Moriaan history only once the Steenschub has been found', async () => {
+    const unfinished = createProgress();
+    // De Moriaan is pas zichtbaar zodra spelers bij Gerritje zijn aangekomen.
+    unfinished.stopProgress['zoete-lieve-gerritje'].state = 'arrived';
+    unfinished.stopProgress['bonus:de-moriaan'].state = 'available';
+    gameState = { ...gameState, progress: unfinished };
+    const page = (key: string) => (
+      <MemoryRouter key={key} initialEntries={['/stop/bonus:de-moriaan']}>
+        <Routes><Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} /></Routes>
+      </MemoryRouter>
+    );
+
+    await act(async () => root.render(page('moriaan-unfinished')));
+    expect(container.querySelector('[aria-label="Uitleg bij het juiste antwoord"]')).toBeNull();
+    expect(container.textContent).not.toContain('Het opvallende hoektorentje hoort bij De Moriaan');
+
+    const completed = createProgress();
+    completed.stopProgress['zoete-lieve-gerritje'].state = 'arrived';
+    completed.stopProgress['bonus:de-moriaan'].state = 'completed';
+    completed.stopProgress['bonus:de-moriaan'].unlockMethod = 'gps';
+    gameState = { ...gameState, progress: completed };
+    await act(async () => root.render(page('moriaan-completed')));
+
+    expect(container.textContent).toContain('Drakenschub gevonden');
+    expect(container.textContent).toContain('Steenschub');
+    const explanation = container.querySelector('[aria-label="Uitleg bij het juiste antwoord"]');
+    expect(explanation?.textContent).toContain('Het verhaal achter De Moriaan');
+    expect(explanation?.textContent).toContain('hoektorentje');
+    expect(explanation?.textContent).toContain('13e eeuw');
+    expect(explanation?.textContent).toContain('jaren vijftig');
+    expect(container.querySelector('a[href="/route"]')?.textContent).toContain('Terug naar hoofdroute');
+  });
+
+  it('reveals the story behind the Zwanenbroedershuis statues only after the Veerschub is completed', async () => {
+    const unfinished = createProgress();
+    unfinished.stopProgress.binnendieze.state = 'completed';
+    unfinished.stopProgress['bonus:zwanenbroedershuis'].state = 'available';
+    gameState = { ...gameState, progress: unfinished };
+    const page = (key: string) => (
+      <MemoryRouter key={key} initialEntries={['/stop/bonus:zwanenbroedershuis']}>
+        <Routes><Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} /></Routes>
+      </MemoryRouter>
+    );
+
+    await act(async () => root.render(page('zwanenbroedershuis-unfinished')));
+    expect(container.querySelector('[aria-label="Uitleg bij het juiste antwoord"]')).toBeNull();
+    expect(container.textContent).not.toContain('De vier stenen gevelbeelden werden in 1962');
+
+    const completed = createProgress();
+    completed.stopProgress.binnendieze.state = 'completed';
+    completed.stopProgress['bonus:zwanenbroedershuis'].state = 'completed';
+    completed.stopProgress['bonus:zwanenbroedershuis'].unlockMethod = 'gps';
+    gameState = { ...gameState, progress: completed };
+    await act(async () => root.render(page('zwanenbroedershuis-completed')));
+
+    expect(container.textContent).toContain('Drakenschub gevonden');
+    expect(container.textContent).toContain('Veerschub');
+    const explanation = container.querySelector('[aria-label="Uitleg bij het juiste antwoord"]');
+    expect(explanation?.textContent).toContain('Het verhaal achter Zwanenbroedershuis');
+    expect(explanation?.textContent).toContain('Marius van Beek');
+    expect(explanation?.textContent).toContain('1962');
+    expect(container.querySelector('a[href="/route"]')?.textContent).toContain('Terug naar hoofdroute');
+  });
+
+  it('keeps the Koepoort history hidden until the Poortschub is completed', async () => {
+    const progress = createProgress();
+    progress.stopProgress['bonus:bolwerk-sint-jan'].state = 'available';
+    gameState = { ...gameState, progress };
+
+    await act(async () => root.render(
+      <MemoryRouter key="bolwerk-unfinished" initialEntries={['/stop/bonus:bolwerk-sint-jan']}>
+        <Routes><Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} /></Routes>
+      </MemoryRouter>
+    ));
+
+    expect(container.querySelector('[aria-label="Uitleg bij het juiste antwoord"]')).toBeNull();
+    expect(container.textContent).not.toContain('De Koepoort was een middeleeuwse toegang');
+    expect(container.textContent).not.toContain('lichte plaat in de bestrating');
+    expect(container.textContent).not.toContain('Kijk eens bij je voeten!');
+  });
+
+  it('keeps bonus completion separate from main stop controls', async () => {
+    gameState = { ...gameState, progress: createProgress() };
+
+    await act(async () => root.render(
+      <MemoryRouter key="bonus" initialEntries={['/stop/bonus:bolwerk-sint-jan']}>
+        <Routes><Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} /></Routes>
+      </MemoryRouter>
+    ));
+
+    const links = Array.from(container.querySelectorAll('a.button')).map((link) => ({ href: link.getAttribute('href'), text: link.textContent }));
+
+    expect(container.textContent).toContain('Drakenschub gevonden');
+    expect(container.textContent).toContain('De Koepoort was een middeleeuwse toegang');
+    expect(container.textContent).toContain('In 1528 werd');
+    expect(container.querySelector('[aria-label="Uitleg bij het juiste antwoord"]')).not.toBeNull();
+    expect(links).toHaveLength(1);
+    expect(links[0]).toMatchObject({ href: '/route', text: 'Terug naar hoofdroute' });
+    expect(container.textContent).not.toContain('Opdracht 1 van 7');
+    expect(container.textContent).not.toContain('Vind de locatie');
+  });
+
+  it('uses phone GPS for main stops and hides redundant status copy', async () => {
+    const progress = createProgress();
+    progress.currentStopId = 'kruithuis';
+    progress.stopProgress.kruithuis.state = 'available';
+    gameState = {
+      ...gameState,
+      progress,
+      teamLocation: null,
+      deviceLocation: {
+        latitude: 51.693,
+        longitude: 5.305,
+        accuracy: 11,
+        capturedAt: new Date().toISOString()
+      }
+    };
+    await act(async () => root.render(
+      <MemoryRouter key="main-device" initialEntries={['/stop/kruithuis']}>
+        <Routes><Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} /></Routes>
+      </MemoryRouter>
+    ));
+    expect(container.querySelector('[data-testid="active-stop-gps"]')?.textContent).toBe('51.693,5.305');
+    expect(container.textContent).not.toContain('We controleren automatisch de beste actuele GPS van jullie team.');
+    expect(container.textContent?.split('Vuur en Water').length).toBe(2);
+  });
+
+  it('shows bonus arrival and verification text by distance and unlock state', async () => {
+    const progress = createProgress();
+    progress.currentStopId = 'bonus:bolwerk-sint-jan';
+    progress.stopProgress['bonus:bolwerk-sint-jan'].state = 'available';
+    progress.stopProgress['bonus:bolwerk-sint-jan'].unlockMethod = 'gps';
+
+    gameState = { ...gameState, progress, teamLocation: setTeamLocation({ latitude: 51.6902, longitude: 5.3002 }) };
+
+    await act(async () => root.render(
+      <MemoryRouter key="bonus-arrival" initialEntries={['/stop/bonus:bolwerk-sint-jan']}>
+        <Routes><Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} /></Routes>
+      </MemoryRouter>
+    ));
+
+    expect(container.textContent).toContain('Nog ongeveer 120 m (hemelsbreed)');
+    expect(container.textContent).not.toContain('Nog ongeveer 0 m lopen');
+    expect(container.textContent).not.toContain('Opdracht openen');
+
+    const lockedProgress = createProgress();
+    lockedProgress.currentStopId = 'bonus:bolwerk-sint-jan';
+    lockedProgress.stopProgress['bonus:bolwerk-sint-jan'].state = 'locked';
+    gameState = { ...gameState, progress: lockedProgress, teamLocation: setTeamLocation({ latitude: 51.6902, longitude: 5.3002 }) };
+
+    await act(async () => root.render(
+      <MemoryRouter key="bonus-check" initialEntries={['/stop/bonus:bolwerk-sint-jan']}>
+        <Routes><Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} /></Routes>
+      </MemoryRouter>
+    ));
+
+    expect(container.textContent).toContain('Nog ongeveer 120 m (hemelsbreed)');
+    expect(container.textContent).not.toContain('Nog ongeveer 0 m lopen');
+    expect(container.textContent).not.toContain('Opdracht openen');
+  });
+
+  it('shows hemelsbrede distance for positive bonus distance', async () => {
+    const progress = createProgress();
+    progress.currentStopId = 'bonus:bolwerk-sint-jan';
+    progress.stopProgress['bonus:bolwerk-sint-jan'].state = 'available';
+    progress.stopProgress['bonus:bolwerk-sint-jan'].unlockMethod = 'gps';
+
+    gameState = { ...gameState, progress, teamLocation: setTeamLocation({ latitude: 51.6905, longitude: 5.301 }) };
+
+    await act(async () => root.render(
+      <MemoryRouter key="bonus-distance" initialEntries={['/stop/bonus:bolwerk-sint-jan']}>
+        <Routes><Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} /></Routes>
+      </MemoryRouter>
+    ));
+
+    expect(container.textContent).toContain('Nog ongeveer');
+    expect(container.textContent).toContain('(hemelsbreed)');
+    expect(container.textContent).not.toContain('lopen');
+  });
+
+  it('keeps GPS fallback text when no usable location exists', async () => {
+    const progress = createProgress();
+    progress.currentStopId = 'bonus:bolwerk-sint-jan';
+    progress.stopProgress['bonus:bolwerk-sint-jan'].state = 'available';
+    gameState = { ...gameState, progress, teamLocation: null };
+
+    await act(async () => root.render(
+      <MemoryRouter key="bonus-no-gps" initialEntries={['/stop/bonus:bolwerk-sint-jan']}>
+        <Routes><Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} /></Routes>
+      </MemoryRouter>
+    ));
+
+    expect(container.textContent).toContain('Afstand bepalen…');
+  });
+
+  it('updates bonus distance from live device GPS without a current team location', async () => {
+    const progress = createProgress();
+    progress.stopProgress.binnendieze.state = 'completed';
+    progress.stopProgress['bonus:zwanenbroedershuis'].state = 'available';
+    const first: LocationResult = {
+      latitude: 51.6905,
+      longitude: 5.306,
+      accuracy: 12,
+      capturedAt: new Date().toISOString()
+    };
+    gameState = { ...gameState, progress, teamLocation: null, deviceLocation: first };
+
+    const screen = (key: string) => (
+      <MemoryRouter key={key} initialEntries={['/stop/bonus:zwanenbroedershuis']}>
+        <Routes><Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} /></Routes>
+      </MemoryRouter>
+    );
+    await act(async () => root.render(screen('device-first')));
+    const distanceLabel = () => container.querySelector('.active-stop-indicator__distance')?.textContent;
+    const initial = distanceLabel();
+    expect(initial).toContain('Nog ongeveer');
+    expect(container.textContent).toContain('Hemelsbrede afstand vanaf jouw actuele GPS-positie.');
+    expect(container.textContent).not.toContain('Afstand bepalen…');
+    expect(container.textContent).not.toContain('We controleren automatisch de beste actuele GPS van jullie team.');
+
+    gameState = {
+      ...gameState,
+      deviceLocation: { ...first, latitude: 51.688710, longitude: 5.309535, capturedAt: new Date().toISOString() }
+    };
+    await act(async () => root.render(screen('device-updated')));
+    expect(distanceLabel()).not.toBe(initial);
+    expect(container.textContent).not.toContain('Afstand bepalen…');
+  });
+
+  it('explains denied GPS instead of showing endless distance loading', async () => {
+    const progress = createProgress();
+    progress.stopProgress.binnendieze.state = 'completed';
+    progress.stopProgress['bonus:zwanenbroedershuis'].state = 'available';
+    gameState = {
+      ...gameState,
+      progress,
+      teamLocation: null,
+      deviceLocation: null,
+      locationError: { kind: 'permission-denied', message: 'Locatietoegang geweigerd.' }
+    };
+    await act(async () => root.render(
+      <MemoryRouter key="device-denied" initialEntries={['/stop/bonus:zwanenbroedershuis']}>
+        <Routes><Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} /></Routes>
+      </MemoryRouter>
+    ));
+    expect(container.textContent).toContain('Geef Chrome locatietoegang om de afstand te zien.');
+    expect(container.textContent).not.toContain('Locatietoegang geweigerd.');
+    expect(container.textContent).not.toContain('Kom dichter bij de schub.');
+  });
+  it('opens an already-started bonus challenge without starting a second run', async () => {
+    const progress = createProgress();
+    progress.stopProgress['bonus:bolwerk-sint-jan'].state = 'started';
+    progress.stopProgress['bonus:bolwerk-sint-jan'].unlockMethod = 'gps';
+    gameState = { ...gameState, progress, startStop: vi.fn() };
+
+    await act(async () => root.render(
+      <MemoryRouter key="bonus-resume" initialEntries={['/stop/bonus:bolwerk-sint-jan']}>
+        <Routes>
+          <Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} />
+          <Route path="/challenge/:stopId" element={<p>Bonusopdracht geopend</p>} />
+        </Routes>
+      </MemoryRouter>
+    ));
+
+    const button = Array.from(container.querySelectorAll('button')).find((element) => element.textContent === 'Opdracht openen');
+    expect(button).toBeDefined();
+    await act(async () => { button!.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
+    expect(container.textContent).toContain('Bonusopdracht geopend');
+    expect(gameState.startStop).not.toHaveBeenCalled();
+  });
+
+  it('shows a visible explanation when the server refuses to open a bonus challenge', async () => {
+    const progress = createProgress();
+    progress.stopProgress['bonus:bolwerk-sint-jan'].state = 'arrived';
+    progress.stopProgress['bonus:bolwerk-sint-jan'].unlockMethod = 'gps';
+    gameState = { ...gameState, progress, startStop: vi.fn().mockResolvedValue(false) };
+
+    await act(async () => root.render(
+      <MemoryRouter key="bonus-blocked" initialEntries={['/stop/bonus:bolwerk-sint-jan']}>
+        <Routes>
+          <Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} />
+          <Route path="/challenge/:stopId" element={<p>Bonusopdracht geopend</p>} />
+        </Routes>
+      </MemoryRouter>
+    ));
+
+    const button = Array.from(container.querySelectorAll('button')).find((element) => element.textContent === 'Opdracht openen');
+    expect(button).toBeDefined();
+    await act(async () => { button!.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
+    expect(gameState.startStop).toHaveBeenCalledWith('bonus:bolwerk-sint-jan');
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain('De opdracht kon niet worden geopend');
+    expect(container.textContent).not.toContain('Bonusopdracht geopend');
+  });
+
+  it('identifies another active bonus challenge rather than presenting an unresponsive button', async () => {
+    const progress = createProgress();
+    progress.stopProgress['bonus:bolwerk-sint-jan'].state = 'arrived';
+    progress.stopProgress['bonus:bolwerk-sint-jan'].unlockMethod = 'gps';
+    gameState = {
+      ...gameState,
+      progress,
+      activeGameRun: { status: 'active', gameId: 'bonus:halve-peer' },
+      startStop: vi.fn()
+    };
+    await act(async () => root.render(
+      <MemoryRouter key="bonus-other-active" initialEntries={['/stop/bonus:bolwerk-sint-jan']}>
+        <Routes>
+          <Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} />
+          <Route path="/challenge/:stopId" element={<p>Andere bonusopdracht geopend</p>} />
+        </Routes>
+      </MemoryRouter>
+    ));
+    expect(container.textContent).toContain('Jullie team is al bezig met een andere opdracht.');
+    const openButton = Array.from(container.querySelectorAll('button')).find((element) => element.textContent === 'Opdracht openen');
+    expect(openButton?.disabled).toBe(true);
+    const goButton = Array.from(container.querySelectorAll('button')).find((element) => element.textContent === 'Ga naar actieve opdracht');
+    await act(async () => { goButton!.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
+    expect(container.textContent).toContain('Andere bonusopdracht geopend');
+    expect(gameState.startStop).not.toHaveBeenCalled();
+  });
+
+  it('opens a verified main route challenge when the server starts it', async () => {
+    const progress = createProgress();
+    progress.currentStopId = 'kruithuis';
+    progress.stopProgress.kruithuis.state = 'arrived';
+    progress.stopProgress.kruithuis.unlockMethod = 'gps';
+    gameState = { ...gameState, progress, startStop: vi.fn().mockResolvedValue(true) };
+
+    await act(async () => root.render(
+      <MemoryRouter key="main-open" initialEntries={['/stop/kruithuis']}>
+        <Routes>
+          <Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} />
+          <Route path="/challenge/:stopId" element={<p>Hoofdopdracht geopend</p>} />
+        </Routes>
+      </MemoryRouter>
+    ));
+    const button = Array.from(container.querySelectorAll('button')).find((element) => element.textContent === 'Opdracht openen');
+    expect(button).toBeDefined();
+    await act(async () => { button!.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
+    expect(gameState.startStop).toHaveBeenCalledWith('kruithuis');
+    expect(container.textContent).toContain('Hoofdopdracht geopend');
+  });
+
+  it('shows one primary arrival action with collapsed location details', async () => {
+    const progress = createProgress();
+    progress.currentStopId = 'zoete-lieve-gerritje';
+    progress.stopProgress['zoete-lieve-gerritje'].state = 'arrived';
+    progress.stopProgress['zoete-lieve-gerritje'].unlockMethod = 'gps';
+    gameState = { ...gameState, progress };
+    await act(async () => root.render(
+      <MemoryRouter key="compact-arrival" initialEntries={['/stop/zoete-lieve-gerritje']}>
+        <Routes><Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} /></Routes>
+      </MemoryRouter>
+    ));
+    expect(container.textContent).not.toContain('Volgende stap:');
+    expect(container.textContent).toContain('Locatie bereikt');
+    const card = container.querySelector('[aria-label="Locatie en opdracht"]')!;
+    expect(card.querySelectorAll('button.button.primary')).toHaveLength(1);
+    expect(card.querySelector('button')?.textContent).toBe('Opdracht openen');
+    expect(card.querySelector('[data-testid="active-stop-gps"]')).toBeNull();
+    const details = card.querySelector<HTMLDetailsElement>('details')!;
+    expect(details.open).toBe(false);
+    expect(details.textContent).toContain(gamePack.stops[1].navigation.clue);
+    expect(card.querySelector('a')?.className).toBe('stop-route-link');
+    expect(container.querySelector('[data-testid="stop-audio-player"]')).not.toBeNull();
+  });
+
+  it('keeps directions and the route button visible while travelling, without an unusable challenge button', async () => {
+    const progress = createProgress();
+    progress.currentStopId = 'zoete-lieve-gerritje';
+    progress.stopProgress['zoete-lieve-gerritje'].state = 'available';
+    gameState = { ...gameState, progress };
+    await act(async () => root.render(
+      <MemoryRouter key="compact-travelling" initialEntries={['/stop/zoete-lieve-gerritje']}>
+        <Routes><Route path="/stop/:stopId" element={<StopPage pack={gamePack} />} /></Routes>
+      </MemoryRouter>
+    ));
+    const card = container.querySelector('[aria-label="Locatie en opdracht"]')!;
+    expect(card.textContent).toContain(gamePack.stops[1].navigation.clue);
+    expect(card.querySelector('details')).toBeNull();
+    expect(card.querySelector('a.button.secondary')?.textContent).toBe('Bekijk op de routekaart');
+    expect(card.querySelector('[data-testid="active-stop-gps"]')).not.toBeNull();
+    expect(container.textContent).not.toContain('Opdracht openen');
+  });
+
+});

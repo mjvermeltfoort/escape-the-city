@@ -1,0 +1,744 @@
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
+import type { FilterSpecification, GeoJSONSource, Map as MapLibreMap } from 'maplibre-gl';
+import type { Feature, FeatureCollection, Polygon } from 'geojson';
+import { GameIcon } from '../../components/GameUi';
+import type { LocationOutcome, LocationResult } from '../location/provider';
+import { loadRouteGeoJson } from '../location/routeDistance';
+import { haversineDistanceMeters } from '../location/distance';
+import { applyMoerasdraakTheme, legFilter, MAP_STYLE_URL, mapColors } from './mapStyle';
+import {
+  createAccuracyPolygon,
+  externalNavigationUrl,
+  getRoutePresentation,
+  isLocationResult,
+  markerStatus,
+  shouldUseFallbackForMapError,
+  startLocationPolling,
+  type LngLat,
+  type RouteGeoJson,
+  type RouteMapProps
+} from './mapTypes';
+import { RouteMarker } from './RouteMarker';
+import { isBonusLocation, type BonusLocation, type RouteStop } from '../game/gameTypes';
+import { visibleBonusLocations } from '../game/gameState';
+import { distanceFromLeg, emptyDeviation, isFreshLocation, updateDeviation } from './navigationHelp';
+import { nearbyConnectorBonus, schubConnectorFor } from './schubConnectors';
+
+type MapMode = 'loading' | 'live' | 'fallback';
+type MarkerPosition = { left: string; top: string };
+
+const MAP_BOUNDS = {
+  minLongitude: 5.2945,
+  maxLongitude: 5.3115,
+  minLatitude: 51.6865,
+  maxLatitude: 51.6982
+};
+
+const stopStatusLabels = {
+  locked: 'Vergrendeld',
+  available: 'Beschikbaar',
+  arrived: 'Locatie gevonden',
+  started: 'Bezig',
+  completed: 'Voltooid'
+} as const;
+
+const emptyFeatureCollection: FeatureCollection = { type: 'FeatureCollection', features: [] };
+
+function accuracyFeature(location: LocationResult): Feature<Polygon> {
+  return {
+    type: 'Feature',
+    properties: {},
+    geometry: createAccuracyPolygon(location)
+  };
+}
+
+function projectFallback([longitude, latitude]: LngLat): MarkerPosition {
+  const x = (longitude - MAP_BOUNDS.minLongitude) / (MAP_BOUNDS.maxLongitude - MAP_BOUNDS.minLongitude) * 100;
+  const y = (MAP_BOUNDS.maxLatitude - latitude) / (MAP_BOUNDS.maxLatitude - MAP_BOUNDS.minLatitude) * 100;
+  return { left: `${x}%`, top: `${y}%` };
+}
+
+function polylinePoints(feature: { geometry: { coordinates: LngLat[] } }) {
+  return feature.geometry.coordinates.map((coordinate) => {
+    const point = projectFallback(coordinate);
+    return `${Number.parseFloat(point.left)},${Number.parseFloat(point.top)}`;
+  }).join(' ');
+}
+
+function hiddenLegFilter() {
+  return ['==', ['get', 'legIndex'], -1] as FilterSpecification;
+}
+
+// De eerste GPS-meting mag het startbeeld corrigeren wanneer de deelnemer
+// werkelijk in de buurt van de route is.
+export function locationNearRoute(location: LocationResult, stops: RouteStop[]) {
+  return stops.some((stop) => Number.isFinite(stop.coordinates.latitude)
+    && Number.isFinite(stop.coordinates.longitude)
+    && haversineDistanceMeters(location, {
+      latitude: stop.coordinates.latitude!,
+      longitude: stop.coordinates.longitude!
+    }) < 3000);
+}
+
+export function autoSelectedStopId(
+  currentStopId: string | undefined,
+  progress: RouteMapProps['progress'],
+  visibleStops: RouteMapProps['visibleStops']
+) {
+  if (!currentStopId) return null;
+  const stop = visibleStops.find((item) => item.id === currentStopId);
+  if (!stop) return null;
+  const state = progress?.stopProgress?.[currentStopId]?.state ?? 'locked';
+  return state === 'locked' ? null : currentStopId;
+}
+
+export function nearestUnfinishedBonus(
+  location: LocationResult | null,
+  bonuses: BonusLocation[],
+  progress: RouteMapProps['progress'],
+  previousId: string | null = null,
+  mainStop: RouteStop | null = null
+): string | null {
+  if (!location || !progress || !Number.isFinite(location.latitude)
+    || !Number.isFinite(location.longitude) || !Number.isFinite(location.accuracy)
+    || location.accuracy < 0) return null;
+
+  const availableBonuses = bonuses.filter((bonus) => progress.stopProgress[bonus.id]?.state !== 'completed'
+    && progress.stopProgress[bonus.id]?.state !== 'locked');
+
+  // Slechte GPS kan een bestaande selectie niet betrouwbaar ontkrachten.
+  // Gebruik zulke metingen ook nooit om een nieuwe schub actief te maken.
+  if (location.accuracy > 40) {
+    return availableBonuses.some((bonus) => bonus.id === previousId) ? previousId : null;
+  }
+
+  const matches = availableBonuses
+    .filter((bonus) => location.accuracy <= bonus.coordinates.maximumAccuracyMeters)
+    .map((bonus) => ({
+      bonus,
+      distance: haversineDistanceMeters(location, {
+        latitude: bonus.coordinates.latitude!,
+        longitude: bonus.coordinates.longitude!
+      })
+    }))
+    .filter(({ bonus, distance }) => bonus.id === previousId
+      ? distance <= bonus.coordinates.radiusMeters + 30
+      : distance + Math.max(10, location.accuracy) <= bonus.coordinates.radiusMeters)
+    .sort((a, b) => a.distance - b.distance);
+
+  const candidate = matches[0];
+  if (!candidate) return null;
+
+  // Routepunten en schubben kunnen binnen elkaars GPS-cirkel vallen.
+  // Blijf op de hoofdopdracht wanneer de GPS niet duidelijk onderscheid maakt.
+  // Bij een al gekozen schub geeft hysterese rust bij kleine GPS-schommelingen.
+  const mainState = mainStop ? progress.stopProgress[mainStop.id]?.state : null;
+  if (mainStop && mainState && mainState !== 'locked' && mainState !== 'completed') {
+    const mainDistance = haversineDistanceMeters(location, {
+      latitude: mainStop.coordinates.latitude!,
+      longitude: mainStop.coordinates.longitude!
+    });
+    const mainCouldBeHere = mainDistance <= mainStop.coordinates.radiusMeters + location.accuracy;
+    const mainToBonusDistance = haversineDistanceMeters(
+      { latitude: mainStop.coordinates.latitude!, longitude: mainStop.coordinates.longitude! },
+      { latitude: candidate.bonus.coordinates.latitude!, longitude: candidate.bonus.coordinates.longitude! }
+    );
+    const extremelyClose = mainToBonusDistance < 50;
+    // Gerritje en Halve Peer liggen maar ~22 m uit elkaar: gebruik bij deze
+    // overlappende punten uitsluitend nauwkeurige fixes vlak bij de schub.
+    // Anders zou de bonus bij Gerritje onterecht verschijnen, of juist nooit bij Peer.
+    if (mainCouldBeHere && extremelyClose && candidate.bonus.id !== previousId
+      && (location.accuracy > 15 || candidate.distance > 15)) return null;
+    const neededDifference = candidate.bonus.id === previousId
+      ? -Math.max(10, location.accuracy)
+      : extremelyClose ? Math.max(12, location.accuracy) : Math.max(20, location.accuracy * 2);
+    if (mainCouldBeHere && mainDistance - candidate.distance <= neededDifference) return null;
+  }
+
+  return candidate.bonus.id;
+}
+
+export function mapFocusStops(currentStopId: string | undefined, visibleStops: RouteStop[]) {
+  const currentIndex = visibleStops.findIndex((stop) => stop.id === currentStopId);
+  return currentIndex === -1 ? visibleStops : visibleStops.slice(currentIndex, currentIndex + 2);
+}
+
+export function RouteMap({ gamePack, progress, visibleStops, locationProvider, deviceLocation, locationError, focusedLocationId }: RouteMapProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const mapRef = useRef<MapLibreMap | null>(null);
+  const stopPollingRef = useRef<(() => void) | null>(null);
+  const autoStartedRef = useRef(false);
+  const locationRef = useRef<LocationResult | null>(null);
+  const fittingMapRef = useRef(false);
+  const [following, setFollowing] = useState(true);
+  const [now, setNow] = useState(Date.now);
+  const [offRoute, setOffRoute] = useState(false);
+  const [helpDismissed, setHelpDismissed] = useState(false);
+  const deviationRef = useRef(emptyDeviation());
+  const deviationLegRef = useRef<string | undefined>(undefined);
+  const [gpsMarkerPosition, setGpsMarkerPosition] = useState<MarkerPosition | null>(null);
+  const [mode, setMode] = useState<MapMode>('loading');
+  const [route, setRoute] = useState<RouteGeoJson | null>(null);
+  const [markerPositions, setMarkerPositions] = useState<Record<string, MarkerPosition>>({});
+  const [connectorBonusId, setConnectorBonusId] = useState<string | null>(null);
+  const [selectedStopId, setSelectedStopId] = useState<string | null>(null);
+  const selectionOriginRef = useRef<'default' | 'gps' | 'manual'>('default');
+  const nearbyBonusRef = useRef<string | null>(null);
+  const sheetRef = useRef<HTMLElement | null>(null);
+  const revealSheetRef = useRef(false);
+  const sheetDismissedRef = useRef(false);
+  const [location, setLocation] = useState<LocationResult | null>(null);
+  const [locationMessage, setLocationMessage] = useState<string | null>(null);
+  // Ook bij de initiële map.load-callback moet de nieuwste GPS-fix beschikbaar zijn.
+  locationRef.current = location;
+  const presentation = useMemo(() => getRoutePresentation(gamePack, progress), [gamePack, progress]);
+
+  const visibleBonusLocationsMemo = useMemo(() => visibleBonusLocations(gamePack, progress), [gamePack, progress]);
+  const mapLocationIdsKey = useMemo(
+    () => [...visibleStops, ...visibleBonusLocationsMemo].map((stop) => stop.id).join('|'),
+    [visibleStops, visibleBonusLocationsMemo]
+  );
+  const mapLocations = useMemo<(RouteStop | BonusLocation)[]>(
+    () => [...visibleStops, ...visibleBonusLocationsMemo],
+    [mapLocationIdsKey]
+  );
+  const selectedStop = mapLocations.find((stop) => stop.id === selectedStopId) ?? null;
+  const selectedState = selectedStop ? progress?.stopProgress?.[selectedStop.id]?.state ?? 'locked' : 'locked';
+  const currentMainStop = visibleStops.find((stop) => stop.id === progress?.currentStopId) ?? null;
+  const nearbyBonusId = nearestUnfinishedBonus(
+    location, visibleBonusLocationsMemo, progress, nearbyBonusRef.current, currentMainStop
+  );
+  const selectedNearbyBonus = selectedStopId !== null && selectedStopId === nearbyBonusId;
+  const selectedBonusId = selectedStop && isBonusLocation(selectedStop) ? selectedStop.id : null;
+  const connectorOrigin = selectedBonusId ?? connectorBonusId;
+  const connector = useMemo(() => visibleBonusLocationsMemo.some((bonus) => bonus.id === connectorOrigin)
+    ? schubConnectorFor(connectorOrigin, presentation.activeLegIndex) : null,
+    [connectorOrigin, presentation.activeLegIndex, visibleBonusLocationsMemo]);
+
+  useEffect(() => {
+    if (selectedStopId || sheetDismissedRef.current || selectionOriginRef.current !== 'default') return;
+    const suggestedStopId = autoSelectedStopId(progress?.currentStopId, progress, visibleStops);
+    if (suggestedStopId) setSelectedStopId(suggestedStopId);
+  }, [progress, selectedStopId, visibleStops]);
+
+  useEffect(() => {
+    // Alleen een verse, bruikbare positie activeert een schub. Een tijdelijke
+    // GPS-time-out mag de gekozen opdracht niet laten verspringen.
+    if (!location) return;
+    if (nearbyBonusId === nearbyBonusRef.current) return;
+    nearbyBonusRef.current = nearbyBonusId;
+    if (nearbyBonusId) {
+      // Een bewuste keuze van de speler wint altijd van automatische GPS-herkenning.
+      if (selectionOriginRef.current === 'manual') return;
+      selectionOriginRef.current = 'gps';
+      sheetDismissedRef.current = false;
+      // Automatische GPS-selectie mag niet zelf de pagina laten verspringen.
+      revealSheetRef.current = false;
+      setSelectedStopId(nearbyBonusId);
+    } else if (selectionOriginRef.current === 'gps') {
+      selectionOriginRef.current = 'default';
+      setSelectedStopId(autoSelectedStopId(progress?.currentStopId, progress, visibleStops));
+    }
+  }, [nearbyBonusId, location, progress, visibleStops]);
+
+  useEffect(() => {
+    if (!selectedStopId || !revealSheetRef.current || !sheetRef.current) return;
+    revealSheetRef.current = false;
+    // Na een tik op een marker scrollt de pagina net genoeg om de kaartinformatie
+    // inclusief knoppen boven de vaste mobiele ondernavigatie zichtbaar te maken.
+    sheetRef.current.scrollIntoView?.({ behavior: 'smooth', block: 'end' });
+  }, [selectedStopId]);
+
+  function selectMapStop(stop: RouteStop | BonusLocation) {
+    setFollowing(false);
+    selectionOriginRef.current = 'manual';
+    sheetDismissedRef.current = false;
+    revealSheetRef.current = true;
+    setSelectedStopId(stop.id);
+    if (selectedStopId === stop.id) {
+      sheetRef.current?.scrollIntoView?.({ behavior: 'smooth', block: 'end' });
+      revealSheetRef.current = false;
+    }
+  }
+
+  function closeStopSheet() {
+    selectionOriginRef.current = 'manual';
+    sheetDismissedRef.current = true;
+    revealSheetRef.current = false;
+    setSelectedStopId(null);
+  }
+
+  useEffect(() => {
+    const target = mapLocations.find((stop) => stop.id === focusedLocationId);
+    if (!target) return;
+    selectMapStop(target);
+    if (mode === 'live' && target.coordinates.latitude !== null && target.coordinates.longitude !== null) {
+      mapRef.current?.easeTo({ center: [target.coordinates.longitude, target.coordinates.latitude], zoom: 16, duration: 350 });
+    }
+  }, [focusedLocationId, mode, mapLocationIdsKey]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void loadRouteGeoJson(gamePack)
+      .then((data) => { if (!cancelled) setRoute(data); })
+      .catch(() => {
+        if (!cancelled) setMode('fallback');
+      });
+    return () => { cancelled = true; };
+  }, [gamePack]);
+
+  useEffect(() => {
+    if (!route || !containerRef.current || mode === 'fallback') return;
+    let cancelled = false;
+    let ready = false;
+    let fallbackTimer = 0;
+
+    const activateFallback = () => {
+      if (cancelled) return;
+      mapRef.current?.remove();
+      mapRef.current = null;
+      setMode('fallback');
+    };
+
+    if (!hasWebGlSupport()) {
+      activateFallback();
+      return;
+    }
+
+    void import('maplibre-gl').then((maplibregl) => {
+      if (cancelled || !containerRef.current) return;
+
+      const map = new maplibregl.Map({
+        container: containerRef.current,
+        style: MAP_STYLE_URL,
+        center: [5.3042, 51.692],
+        zoom: 14.3,
+        minZoom: 12,
+        maxZoom: 19,
+        maxPitch: 0,
+        attributionControl: false,
+        scrollZoom: false,
+        dragRotate: false,
+        pitchWithRotate: false
+      });
+      mapRef.current = map;
+      map.touchZoomRotate.disableRotation();
+      map.addControl(new maplibregl.NavigationControl({ showCompass: false, visualizePitch: false }), 'top-right');
+      map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-right');
+
+      const updateMarkerPositions = () => {
+        const positions: Record<string, MarkerPosition> = {};
+        for (const stop of mapLocations) {
+          const projected = map.project([stop.coordinates.longitude!, stop.coordinates.latitude!]);
+          positions[stop.id] = { left: `${projected.x}px`, top: `${projected.y}px` };
+        }
+        setMarkerPositions(positions);
+        const userLocation = locationRef.current;
+        if (userLocation) {
+          const p = map.project([userLocation.longitude, userLocation.latitude]);
+          setGpsMarkerPosition({ left: `${p.x}px`, top: `${p.y}px` });
+        } else {
+          setGpsMarkerPosition(null);
+        }
+      };
+
+      map.on('load', () => {
+        if (cancelled) return;
+        ready = true;
+        window.clearTimeout(fallbackTimer);
+        applyMoerasdraakTheme(map);
+        map.addSource('moerasdraak-route', { type: 'geojson', data: route });
+        map.addSource('schub-connector', { type: 'geojson', data: emptyFeatureCollection });
+        map.addSource('route-accuracy', { type: 'geojson', data: emptyFeatureCollection });
+        map.addLayer({
+          id: 'route-full',
+          type: 'line',
+          source: 'moerasdraak-route',
+          layout: { visibility: presentation.fullRouteVisible ? 'visible' : 'none', 'line-cap': 'round', 'line-join': 'round' },
+          paint: { 'line-color': mapColors.completed, 'line-width': 4, 'line-opacity': 0.72 }
+        });
+        map.addLayer({
+          id: 'route-completed',
+          type: 'line',
+          source: 'moerasdraak-route',
+          filter: presentation.completedLegIndices.length ? legFilter(presentation.completedLegIndices) : hiddenLegFilter(),
+          layout: { 'line-cap': 'round', 'line-join': 'round' },
+          paint: { 'line-color': mapColors.completed, 'line-width': 5, 'line-opacity': 0.95 }
+        });
+        map.addLayer({
+          id: 'route-active-outline',
+          type: 'line',
+          source: 'moerasdraak-route',
+          filter: presentation.activeLegIndex === null ? hiddenLegFilter() : legFilter([presentation.activeLegIndex]),
+          layout: { 'line-cap': 'round', 'line-join': 'round' },
+          paint: { 'line-color': mapColors.completed, 'line-width': 9, 'line-opacity': 0.96 }
+        });
+        map.addLayer({
+          id: 'route-active',
+          type: 'line',
+          source: 'moerasdraak-route',
+          filter: presentation.activeLegIndex === null ? hiddenLegFilter() : legFilter([presentation.activeLegIndex]),
+          layout: { 'line-cap': 'round', 'line-join': 'round' },
+          paint: { 'line-color': mapColors.active, 'line-width': 5, 'line-opacity': 1 }
+        });
+        map.addLayer({
+          id: 'schub-connector',
+          type: 'line',
+          source: 'schub-connector',
+          layout: { 'line-cap': 'round', 'line-join': 'round' },
+          paint: { 'line-color': mapColors.active, 'line-width': 4, 'line-dasharray': [2, 2], 'line-opacity': 0.95 }
+        });
+        map.addLayer({
+          id: 'route-accuracy',
+          type: 'fill',
+          source: 'route-accuracy',
+          paint: { 'fill-color': mapColors.accuracy, 'fill-opacity': 0.14 }
+        });
+        map.addLayer({
+          id: 'route-accuracy-outline',
+          type: 'line',
+          source: 'route-accuracy',
+          paint: { 'line-color': mapColors.accuracy, 'line-width': 2, 'line-opacity': 0.82 }
+        });
+        const coordinates = mapFocusStops(progress?.currentStopId, visibleStops).map((stop) => [
+          stop.coordinates.longitude!,
+          stop.coordinates.latitude!
+        ] as LngLat);
+        const initialLocation = locationRef.current;
+        if (initialLocation && locationNearRoute(initialLocation, visibleStops)) {
+          coordinates.push([initialLocation.longitude, initialLocation.latitude]);
+        }
+        if (coordinates.length) {
+          const bounds = coordinates.reduce(
+            (result, coordinate) => result.extend(coordinate),
+            new maplibregl.LngLatBounds(coordinates[0], coordinates[0])
+          );
+          fittingMapRef.current = true;
+          try {
+            map.fitBounds(bounds, {
+              padding: { top: 46, right: 46, bottom: 104, left: 46 },
+              maxZoom: 16.8,
+              duration: 0
+            });
+          } finally {
+            fittingMapRef.current = false;
+          }
+        }
+        updateMarkerPositions();
+        setMode('live');
+      });
+      map.on('dragstart', () => {
+        setFollowing(false);
+      });
+      map.on('zoomstart', (event) => {
+        if (event.originalEvent && !fittingMapRef.current) {
+          setFollowing(false);
+        }
+      });
+      map.on('move', updateMarkerPositions);
+      map.on('resize', updateMarkerPositions);
+      map.on('error', (event) => {
+        if (shouldUseFallbackForMapError(event.error, ready)) activateFallback();
+      });
+
+      fallbackTimer = window.setTimeout(() => {
+        if (!ready || !map.loaded()) activateFallback();
+      }, 10000);
+    }).catch(activateFallback);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(fallbackTimer);
+      mapRef.current?.remove();
+      mapRef.current = null;
+    };
+  }, [route, gamePack, mapLocationIdsKey]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || mode !== 'live' || !map.getLayer('route-active')) return;
+    map.setLayoutProperty('route-full', 'visibility', presentation.fullRouteVisible ? 'visible' : 'none');
+    map.setFilter(
+      'route-completed',
+      presentation.completedLegIndices.length ? legFilter(presentation.completedLegIndices) : hiddenLegFilter()
+    );
+    const activeFilter = presentation.activeLegIndex === null
+      ? hiddenLegFilter()
+      : legFilter([presentation.activeLegIndex]);
+    map.setFilter('route-active-outline', activeFilter);
+    map.setFilter('route-active', activeFilter);
+  }, [mode, presentation]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || mode !== 'live') return;
+    const source = map.getSource('schub-connector') as GeoJSONSource | undefined;
+    source?.setData(connector ? { type: 'FeatureCollection', features: [connector] } : emptyFeatureCollection);
+  }, [connector, mode]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || mode !== 'live') return;
+    const accuracySource = map.getSource('route-accuracy') as GeoJSONSource | undefined;
+    accuracySource?.setData(location ? accuracyFeature(location) : emptyFeatureCollection);
+    if (!location) {
+      setGpsMarkerPosition(null);
+      return;
+    }
+    const projected = map.project([location.longitude, location.latitude]);
+    setGpsMarkerPosition({ left: `${projected.x}px`, top: `${projected.y}px` });
+
+    if (following && location.accuracy <= 40 && isFreshLocation(location, Date.now())) {
+      map.easeTo({ center: [location.longitude, location.latitude], zoom: 16.5, duration: 300 });
+    }
+  }, [location, mode, following]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    const refresh = () => setNow(Date.now());
+    document.addEventListener('visibilitychange', refresh);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', refresh);
+    };
+  }, []);
+
+  const activeLeg = presentation.activeLegIndex === null ? null
+    : route?.features.find((leg) => leg.properties.legIndex === presentation.activeLegIndex) ?? null;
+  useEffect(() => {
+    if (!isFreshLocation(location, Date.now()) || location.accuracy > 40) return;
+    const nearby = nearbyConnectorBonus(location, visibleBonusLocationsMemo);
+    if (nearby) setConnectorBonusId(nearby);
+    else if (!activeLeg || distanceFromLeg(location, activeLeg) <= 25 + location.accuracy) {
+      setConnectorBonusId(null);
+    }
+    // Keep the last visited schub's line while walking back; reaching the active
+    // route removes it. A map selection can also preview a visible schub's line.
+  }, [location, activeLeg, visibleBonusLocationsMemo]);
+
+  const bonusDetour = Boolean(connector && location && distanceFromLeg(location, connector) <= 40 + location.accuracy)
+    || Boolean(selectedStop && isBonusLocation(selectedStop)
+    && selectedState !== 'completed' && selectedState !== 'locked')
+    || Boolean(location && visibleBonusLocationsMemo.some((bonus) =>
+      progress?.stopProgress[bonus.id]?.state !== 'completed'
+      && haversineDistanceMeters(location, {
+        latitude: bonus.coordinates.latitude!, longitude: bonus.coordinates.longitude!
+      }) <= bonus.coordinates.radiusMeters + 100));
+
+  useEffect(() => {
+    const legId = activeLeg?.properties.toStopId;
+    if (deviationLegRef.current !== legId) deviationRef.current = emptyDeviation();
+    deviationLegRef.current = legId;
+    deviationRef.current = updateDeviation(deviationRef.current, location, activeLeg, Date.now(), bonusDetour);
+    setOffRoute(deviationRef.current.confirmed);
+    if (!deviationRef.current.confirmed) setHelpDismissed(false);
+  }, [activeLeg, location, now, bonusDetour]);
+
+  useEffect(() => () => stopPollingRef.current?.(), []);
+
+  // De gamecontext kijkt al continu naar de GPS van dit toestel. Gebruik die
+  // metingen rechtstreeks zodat de marker niet aan een verouderde teampositie hangt.
+  useEffect(() => {
+    if (deviceLocation === undefined) return;
+    const current = isFreshLocation(deviceLocation ?? null, Date.now()) ? deviceLocation! : null;
+    setLocation(current);
+    if (current && !locationError) setLocationMessage(null);
+  }, [deviceLocation, locationError, now]);
+
+  // Fallback voor losse kaartweergaven buiten de gamecontext (o.a. componenttests).
+  useEffect(() => {
+    if (deviceLocation !== undefined || autoStartedRef.current || stopPollingRef.current) return;
+    autoStartedRef.current = true;
+    stopPollingRef.current = startLocationPolling(locationProvider, handleLocationOutcome);
+  }, [locationProvider, deviceLocation]);
+
+  function handleLocationOutcome(outcome: LocationOutcome) {
+    if (isLocationResult(outcome)) {
+      setLocation({ ...outcome, capturedAt: outcome.capturedAt ?? new Date().toISOString() });
+      setLocationMessage(null);
+      return;
+    }
+    setLocationMessage(outcome.message);
+  }
+
+  function enableLocation() {
+    if (deviceLocation !== undefined) {
+      // Handmatige herpoging wanneer de browser nog geen geldige GPS-meting levert.
+      void locationProvider.getCurrentPosition({ enableHighAccuracy: true, maximumAge: 0, timeout: 10000 })
+        .then(handleLocationOutcome);
+      return;
+    }
+    if (stopPollingRef.current) return;
+    stopPollingRef.current = startLocationPolling(locationProvider, handleLocationOutcome);
+  }
+
+  function centerOnLocation() {
+    const map = mapRef.current;
+    const current = location;
+    setFollowing(true);
+    if (mode === 'fallback') {
+      setHelpDismissed(true);
+      containerRef.current?.parentElement?.scrollIntoView?.({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+    if (!map || !current || !isFreshLocation(current, Date.now())) return;
+    map.easeTo({ center: [current.longitude, current.latitude], zoom: 16.5, duration: 300 });
+  }
+
+  const activeLocation = isFreshLocation(location, Date.now()) ? location : null;
+  const showHelp = offRoute && !helpDismissed && Boolean(activeLocation) && !locationError;
+  const gpsMessage = locationError?.message ?? locationMessage ?? (!activeLocation ? 'Locatie wordt bijgewerkt…'
+    : activeLocation.accuracy > 40 ? `GPS is onnauwkeurig (± ${Math.round(activeLocation.accuracy)} m). Ga naar een open plek.` : null);
+  const fallbackLocationPosition = activeLocation
+    ? projectFallback([activeLocation.longitude, activeLocation.latitude])
+    : null;
+  const fallbackAccuracyPoints = activeLocation
+    ? createAccuracyPolygon(activeLocation).coordinates[0].map((coordinate) => {
+      const point = projectFallback(coordinate);
+      return `${Number.parseFloat(point.left)},${Number.parseFloat(point.top)}`;
+    }).join(' ')
+    : '';
+
+  return (
+    <section className="route-map-view" aria-label="Interactieve routekaart">
+      <div className={`interactive-route-map interactive-route-map--${mode}${showHelp ? ' has-navigation-help' : ''}`}>
+        <div
+          ref={containerRef}
+          className="interactive-route-map__canvas"
+          role="region"
+          aria-label="Kaart van de wandelroute door Den Bosch"
+        />
+
+        {mode === 'fallback' ? (
+          <div className="fallback-route-map" role="region" aria-label="Offline routekaart van Den Bosch">
+            <img src={`${import.meta.env.BASE_URL}maps/route-map-fallback.webp`} alt="" />
+            <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+              {route && presentation.fullRouteVisible ? route.features.map((feature) => (
+                <polyline className="fallback-route-map__full" key={`full-${feature.properties.legIndex}`} points={polylinePoints(feature)} />
+              )) : null}
+              {route?.features
+                .filter((feature) => presentation.completedLegIndices.includes(feature.properties.legIndex))
+                .map((feature) => (
+                  <polyline className="fallback-route-map__completed" key={`completed-${feature.properties.legIndex}`} points={polylinePoints(feature)} />
+                ))}
+              {route && presentation.activeLegIndex !== null && route.features[presentation.activeLegIndex] ? (
+                <>
+                  <polyline className="fallback-route-map__active-outline" points={polylinePoints(route.features[presentation.activeLegIndex])} />
+                  <polyline className="fallback-route-map__active" points={polylinePoints(route.features[presentation.activeLegIndex])} />
+                </>
+              ) : null}
+              {connector ? <polyline className="fallback-route-map__connector" points={polylinePoints(connector)} /> : null}
+              {fallbackAccuracyPoints ? <polygon className="fallback-route-map__accuracy" points={fallbackAccuracyPoints} /> : null}
+            </svg>
+            {fallbackLocationPosition ? (
+              <span className="fallback-route-map__position" style={fallbackLocationPosition} aria-label="Jouw GPS-positie" />
+            ) : null}
+            <a
+              className="fallback-route-map__attribution"
+              href="https://www.openstreetmap.org/copyright"
+              target="_blank"
+              rel="noreferrer"
+            >
+              Route © OpenStreetMap-bijdragers
+            </a>
+          </div>
+        ) : null}
+
+        {mode === 'loading' ? (
+          <div className="route-map-loading" role="status">
+            <GameIcon name="map" size={24} />
+            <span>Kaart laden…</span>
+          </div>
+        ) : null}
+
+        <div className="route-marker-layer">
+          {mode === 'live' && activeLocation && gpsMarkerPosition ? (
+            <span
+              className="route-map__my-location"
+              style={gpsMarkerPosition}
+              role="img"
+              aria-label="Jouw actuele GPS-positie"
+              data-testid="route-gps-marker"
+            />
+          ) : null}
+          {mapLocations.map((stop) => {
+            const state = progress?.stopProgress?.[stop.id]?.state ?? 'locked';
+            const position = mode === 'fallback'
+              ? projectFallback([stop.coordinates.longitude!, stop.coordinates.latitude!])
+              : markerPositions[stop.id];
+            if (!position) return null;
+            return (
+              <RouteMarker
+                key={stop.id}
+                stop={stop}
+                status={isBonusLocation(stop) && nearbyBonusId === stop.id ? 'current' : markerStatus(stop, state, progress?.currentStopId)}
+                selected={selectedStopId === stop.id}
+                style={position}
+                onSelect={selectMapStop}
+              />
+            );
+          })}
+        </div>
+
+        <span className="map-follow-status" role="status" aria-live="polite">{gpsMessage
+          ?? (mode === 'fallback' ? 'Offline kaart' : following ? 'Locatie volgen aan' : 'Volgen gepauzeerd')}</span>
+        {mode !== 'fallback' || !activeLocation ? <button
+          className="map-location-button"
+          type="button"
+          onClick={activeLocation ? centerOnLocation : enableLocation}
+          aria-pressed={Boolean(activeLocation) && following}
+          aria-label={activeLocation ? 'Centreer op mijn locatie' : 'Mijn locatie inschakelen'}
+          title={activeLocation ? 'Centreer op mijn locatie' : 'Mijn locatie inschakelen'}
+        >
+          <GameIcon name="location" size={20} />
+        </button> : null}
+        {showHelp && currentMainStop ? (
+          <section className="map-navigation-help" aria-label="Navigatiehulp">
+            <button className="route-bottom-sheet__close" type="button" aria-label="Navigatiehulp sluiten" onClick={() => setHelpDismissed(true)}>×</button>
+            <h2>Even de weg kwijt?</h2>
+            <p role="status">Jullie lijken van de route af te wijken.</p>
+            <button className="button primary" type="button" onClick={centerOnLocation}>{mode === 'fallback' ? 'Toon de routekaart' : 'Toon mijn locatie'}</button>
+            <a className="button secondary" href={externalNavigationUrl(currentMainStop)} target="_blank" rel="noreferrer">Open wandelnavigatie</a>
+          </section>
+        ) : null}
+      </div>
+      {!showHelp && selectedStop && (selectedState !== 'locked' || isBonusLocation(selectedStop)) ? (
+        <section ref={sheetRef} className="route-bottom-sheet" aria-label={isBonusLocation(selectedStop) ? `Schub: ${selectedStop.title}` : `Stop ${selectedStop.order}: ${selectedStop.title}`}>
+          <button className="route-bottom-sheet__close" type="button" aria-label="Stopinformatie sluiten" onClick={closeStopSheet}>×</button>
+          <span className="route-stop__meta">{isBonusLocation(selectedStop)
+            ? selectedNearbyBonus ? 'Verborgen schub · Jullie zijn hier' : 'Verborgen vondst'
+            : selectedStop.isFinal ? 'Finale' : `Opdracht ${selectedStop.order}`} · {stopStatusLabels[selectedState]}</span>
+          <h2>{isBonusLocation(selectedStop) && selectedState !== 'completed' && !selectedNearbyBonus ? 'Verborgen schub' : selectedStop.title}</h2>
+          <p>{isBonusLocation(selectedStop) && selectedState !== 'completed' ? selectedStop.hiddenClue : selectedStop.navigation.clue}</p>
+          {isBonusLocation(selectedStop) ? <p className="muted small">Omweg: circa {selectedStop.estimatedDetourMinutes} minuten · maximaal {selectedStop.maximumPoints} bonuspunten</p> : null}
+          <div className="route-bottom-sheet__actions">
+            <Link className="button primary" to={`/stop/${selectedStop.id}`}>{isBonusLocation(selectedStop) ? selectedNearbyBonus ? 'Open schubopdracht' : 'Bekijk schub' : 'Bekijk stop'}</Link>
+          </div>
+        </section>
+      ) : null}
+    </section>
+  );
+}
+
+export function visibleRouteFeatures(route: RouteGeoJson, presentation: ReturnType<typeof getRoutePresentation>) {
+  return route.features.filter((feature) => {
+    const legIndex = Number(feature.properties?.legIndex);
+    return legIndex !== route.features.length - 1 || presentation.finalLegVisible;
+  });
+}
+
+export function hasWebGlSupport() {
+  try {
+    const canvas = document.createElement('canvas');
+    return Boolean(
+      canvas.getContext('webgl2')
+      || canvas.getContext('webgl')
+      || canvas.getContext('experimental-webgl')
+    );
+  } catch {
+    return false;
+  }
+}
+
+

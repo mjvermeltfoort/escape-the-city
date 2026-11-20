@@ -1,0 +1,89 @@
+import { act } from 'react';
+import { createRoot } from 'react-dom/client';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const mockResumeWithJoinCode = vi.fn();
+const mockRemoveActiveTeam = vi.fn();
+const mockNavigate = vi.fn();
+
+vi.mock('../components/GameUi', () => ({
+  PageShell: ({ children }: { children: React.ReactNode }) => <section>{children}</section>,
+  ProgressBar: () => <div />,
+  SyncStatus: () => <div />,
+  TeamAvatar: ({ name }: { name: string }) => <span>{name}</span>
+}));
+
+vi.mock('../lib/supabase/sync', () => ({
+  isSupabaseAvailable: () => true
+}));
+
+vi.mock('../app/gameContext', () => ({
+  useGame: () => ({
+    resumeWithJoinCode: mockResumeWithJoinCode,
+    removeActiveTeam: mockRemoveActiveTeam,
+    activeTeam: null,
+    progress: null,
+    syncStatus: 'saved',
+    syncMessage: 'Alles opgeslagen'
+  })
+}));
+
+vi.mock('react-router-dom', async () => {
+  const actual = await vi.importActual<typeof import('react-router-dom')>('react-router-dom');
+  return {
+    ...actual,
+    useNavigate: () => mockNavigate
+  };
+});
+
+import { TeamPage } from './TeamPage';
+import { gamePack } from '../game-data/moerasdraak/game';
+
+const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+
+describe('TeamPage', () => {
+  const container = document.createElement('div');
+  const root = createRoot(container);
+
+  beforeEach(() => {
+    actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+    container.innerHTML = '';
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    act(() => {
+      root.render(null);
+    });
+    container.innerHTML = '';
+    actEnvironment.IS_REACT_ACT_ENVIRONMENT = false;
+  });
+
+  it('only renders team-code join flow when there is no active team', () => {
+    act(() => {
+      root.render(<TeamPage pack={gamePack} />);
+    });
+
+    expect(container.textContent).toContain('Voer jullie teamcode in');
+    expect(container.querySelector('form')).not.toBeNull();
+    expect(container.querySelector<HTMLInputElement>('#team-code')).not.toBeNull();
+    expect(container.querySelector('form')?.querySelector('button[type="submit"]')).not.toBeNull();
+    expect(container.textContent).not.toContain('teamnaam');
+    expect(container.textContent).not.toContain('Nieuw team');
+  });
+  it('opens preparation after joining with a valid teamcode', async () => {
+    mockResumeWithJoinCode.mockResolvedValue('team-3');
+    await act(async () => root.render(<TeamPage pack={gamePack} />));
+    const input = container.querySelector<HTMLInputElement>('#team-code');
+    expect(input).not.toBeNull();
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set?.call(input, 'abc123');
+      input?.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await act(async () => {
+      container.querySelector('form')?.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    });
+    expect(mockResumeWithJoinCode).toHaveBeenCalledWith('ABC123');
+    expect(mockNavigate).toHaveBeenCalledWith('/voorbereiden');
+  });
+});

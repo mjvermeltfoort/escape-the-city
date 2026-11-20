@@ -1,0 +1,83 @@
+import { useState } from 'react';
+import { Link } from 'react-router-dom';
+import type { GamePack } from '../features/game/gameTypes';
+import { useGame } from '../app/gameContext';
+import { AudioControl, GameIcon, SyncStatus } from '../components/GameUi';
+import { HintHenkIntro } from '../components/HintHenkIntro';
+import { StartLocationCheck } from '../components/StartLocationCheck';
+import { useAudio } from '../features/audio/audioContext';
+
+export function isHomeSyncStatusVisible(status: 'saved' | 'local' | 'syncing' | 'failed' | 'offline') {
+  return status !== 'saved';
+}
+
+export function HomePage({ pack }: { pack: GamePack }) {
+  const { teams, activeTeam, progress, syncStatus, syncMessage } = useGame();
+  const { unlockAudio } = useAudio();
+  const [henkVisible, setHenkVisible] = useState(true);
+  const current = activeTeam && progress ? { team: activeTeam, progress } : null;
+  const lastTeam = current ?? (teams[0] ? { team: teams[0], progress: null } : null);
+  const baseUrl = import.meta.env.BASE_URL ?? '/';
+
+  return (
+    <main className="page shell home-page">
+      <div className="page-content">
+        <section className="home-hero">
+          <AudioControl className="home-audio-control" />
+          <div className="home-hero__visual">
+            <img
+              className="home-welcome-image"
+              src={`${baseUrl}images/welkom-image.png`}
+              alt=""
+              fetchPriority="high"
+              decoding="async"
+            />
+            <h1 className="visually-hidden">Het Geheim van de Moerasdraak — Den Bosch</h1>
+          </div>
+          <div className="home-hero__content">
+            <p className="home-subtitle">Een escape the city-avontuur vol raadsels, geheimen en Bossche legendes.</p>
+            <HintHenkIntro onVisibilityChange={setHenkVisible} />
+            <div className="home-actions">
+              {lastTeam ? (
+                <Link className="button primary" to="/voorbereiden" onClick={unlockAudio}>Verder met team {lastTeam.team.name}</Link>
+              ) : (
+                <Link className="button primary" to="/team" onClick={unlockAudio}>Deelnemen met teamcode</Link>
+              )}
+            </div>
+            <StartLocationCheck blockedByIntro={henkVisible} />
+            {isHomeSyncStatusVisible(syncStatus) ? (
+              <div className="home-sync-status" aria-live="polite">
+                <SyncStatus status={syncStatus} message={syncMessage} />
+              </div>
+            ) : null}
+          </div>
+        </section>
+
+        <div className="home-details stack stack--large" id="uitleg">
+          <section>
+            <p className="eyebrow center" id="uitleg-title" tabIndex={-1}>Jullie avontuur</p>
+            <div className="fact-grid">
+              <div className="fact"><GameIcon name="time" /><strong>2–2,5 uur</strong><span>speelduur</span></div>
+              <div className="fact"><GameIcon name="compass" /><strong>{pack.estimatedDistanceKm} km</strong><span>door de stad</span></div>
+              <div className="fact"><GameIcon name="scroll" /><strong>{pack.stops.length} opdrachten</strong><span>raadsels en verhalen</span></div>
+              <div className="fact"><GameIcon name="dragon" /><strong>Samen spelen</strong><span>één team, één missie</span></div>
+            </div>
+          </section>
+
+
+          {lastTeam ? (
+            <section className="card stack">
+              <p className="eyebrow">Laatst gebruikt</p>
+              <h2>{lastTeam.team.name}</h2>
+              <p className="muted small">Laatste activiteit: {new Date(lastTeam.team.lastActivityAt).toLocaleString('nl-NL')}</p>
+              {lastTeam.progress ? <p>Voortgang: {lastTeam.progress.collectedRewards.length} van {pack.stops.length} herinneringen.</p> : null}
+              <Link className="button secondary" to="/route">Bekijk route</Link>
+            </section>
+          ) : null}
+        </div>
+      </div>
+    </main>
+  );
+}
+
+

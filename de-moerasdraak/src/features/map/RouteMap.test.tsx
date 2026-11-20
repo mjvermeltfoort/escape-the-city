@@ -1,0 +1,517 @@
+import { act } from 'react';
+import { createRoot } from 'react-dom/client';
+import { MemoryRouter } from 'react-router-dom';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createInitialProgress } from '../game/gameState';
+import { gamePack } from '../../game-data/moerasdraak/game';
+import type { RouteMapProps } from './mapTypes';
+import type { BonusLocation, RouteStop } from '../game/gameTypes';
+
+const mapState = vi.hoisted(() => ({
+  fitBounds: vi.fn(),
+  easeTo: vi.fn(),
+  remove: vi.fn(),
+  addControl: vi.fn(),
+  addSource: vi.fn(),
+  addLayer: vi.fn(),
+  touchZoomRotate: { disableRotation: vi.fn() },
+  on: vi.fn((event: string, handler: () => void) => {
+    if (event === 'load') handler();
+    return mapState;
+  }),
+  loaded: vi.fn(() => true),
+  getLayer: vi.fn(() => true),
+  setData: vi.fn(),
+  setConnectorData: vi.fn(),
+  getSource: vi.fn((id: string) => ({ setData: id === 'schub-connector' ? mapState.setConnectorData : mapState.setData })),
+  project: vi.fn(([longitude, latitude]: [number, number]) => ({ x: longitude * 100, y: latitude * 100 })),
+  setLayoutProperty: vi.fn(),
+  setFilter: vi.fn(),
+  resize: vi.fn(),
+  removeControl: vi.fn()
+}));
+
+vi.mock('maplibre-gl', () => {
+  class Map {
+    touchZoomRotate = mapState.touchZoomRotate;
+    constructor() {
+      return mapState;
+    }
+  }
+  class NavigationControl {}
+  class AttributionControl {}
+  class LngLatBounds {
+    coordinates: number[][];
+    constructor(start: number[], end: number[]) {
+      this.coordinates = [start, end];
+    }
+    extend(value: number[]) {
+      this.coordinates.push(value);
+      return this;
+    }
+  }
+  return { Map, NavigationControl, AttributionControl, LngLatBounds };
+});
+
+vi.mock('./mapStyle', () => ({
+  MAP_STYLE_URL: 'style',
+  mapColors: { completed: '#000', active: '#111', accuracy: '#222' },
+  applyMoerasdraakTheme: vi.fn(),
+  legFilter: vi.fn(() => ['all'])
+}));
+vi.mock('./RouteMarker', () => ({
+  RouteMarker: ({ stop, onSelect }: {
+    stop: RouteStop | BonusLocation;
+    onSelect: (value: RouteStop | BonusLocation) => void;
+  }) => <button data-testid={`map-select-${stop.id}`} type="button" onClick={() => onSelect(stop)}>{stop.title}</button>
+}));
+vi.mock('../components/GameUi', () => ({ GameIcon: () => null }));
+vi.mock('react-router-dom', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('react-router-dom')>();
+  return {
+    ...actual,
+    Link: ({ to, children, className }: { to: string; children: React.ReactNode; className?: string }) => (
+      <a href={to} className={className}>{children}</a>
+    )
+  };
+});
+vi.mock('./mapTypes', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./mapTypes')>();
+  return {
+    ...actual,
+    startLocationPolling: vi.fn((provider, onOutcome) => {
+      void provider.getCurrentPosition?.();
+      void onOutcome({ latitude: 51.69, longitude: 5.3, accuracy: 12 });
+      return vi.fn();
+    }),
+    shouldUseFallbackForMapError: vi.fn(() => false)
+  };
+});
+vi.mock('../location/routeDistance', () => ({ loadRouteGeoJson: vi.fn(async () => ({ type: 'FeatureCollection', features: [
+  {
+    type: 'Feature',
+    properties: { legIndex: 0, fromStopId: 'a', toStopId: 'b', corridor: 'x' },
+    geometry: { type: 'LineString', coordinates: [[5.3, 51.69], [5.304, 51.692], [5.31, 51.695]] }
+  }
+] })) }));
+vi.mock('../game/gameState', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../game/gameState')>();
+  return {
+    ...actual,
+    visibleBonusLocations: vi.fn(actual.visibleBonusLocations)
+  };
+});
+
+import { RouteMap, nearestUnfinishedBonus } from './RouteMap';
+
+function locationProvider(): RouteMapProps['locationProvider'] {
+  return {
+    getCurrentPosition: vi.fn(async () => ({ latitude: 51.69, longitude: 5.3, accuracy: 12 }))
+  };
+}
+
+function progressAtGerritje() {
+  const progress = progressWithCurrentStop();
+  progress.stopProgress['drakenfontein'].state = 'completed';
+  progress.stopProgress['zoete-lieve-gerritje'].state = 'available';
+  progress.currentStopId = 'zoete-lieve-gerritje';
+  return progress;
+}
+
+function progressNearFinale() {
+  const progress = progressWithCurrentStop();
+  for (const stop of gamePack.stops.slice(0, -1)) progress.stopProgress[stop.id].state = 'completed';
+  progress.currentStopId = 'bossche-brouwers';
+  progress.stopProgress['bossche-brouwers'].state = 'available';
+  return progress;
+}
+
+function progressWithCurrentStop() {
+  const progress = createInitialProgress('team-1', gamePack);
+  progress.stopProgress[gamePack.stops[0].id].state = 'available';
+  return progress;
+}
+
+describe('RouteMap', () => {
+  const container = document.createElement('div');
+  const root = createRoot(container);
+  let testKey = 0;
+
+  beforeAll(() => {
+    (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    window.clearTimeout = vi.fn(window.clearTimeout);
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({} as never);
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+
+  beforeEach(() => {
+    testKey += 1;
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    act(() => root.render(null));
+    vi.useRealTimers();
+  });
+
+  afterAll(() => {
+    act(() => root.unmount());
+    (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+  });
+
+  async function render(
+    visibleStops: RouteMapProps['visibleStops'],
+    progress: RouteMapProps['progress'],
+    deviceLocation?: RouteMapProps['deviceLocation'],
+    focusedLocationId?: string,
+    locationError?: RouteMapProps['locationError']
+  ) {
+    await act(async () => root.render(
+      <MemoryRouter key={testKey}>
+        <RouteMap
+          gamePack={gamePack}
+          progress={progress}
+          visibleStops={visibleStops}
+          locationProvider={locationProvider()}
+          deviceLocation={deviceLocation}
+          focusedLocationId={focusedLocationId}
+          locationError={locationError}
+        />
+      </MemoryRouter>
+    ));
+  }
+
+  it('opens and centres the schub explicitly requested by a Henk reminder', async () => {
+    const progress = progressWithCurrentStop();
+    progress.stopProgress.drakenfontein.state = 'arrived';
+    const bonus = gamePack.bonusLocations![0];
+    await render(gamePack.stops.filter((s) => !s.isFinal), progress, undefined, bonus.id);
+    expect(container.querySelector(`[aria-label="Schub: ${bonus.title}"]`)).not.toBeNull();
+    expect(mapState.easeTo).toHaveBeenCalledWith(expect.objectContaining({ center: [bonus.coordinates.longitude, bonus.coordinates.latitude] }));
+  });
+
+  it('starts location polling automatically and keeps manual recenter available', async () => {
+    const visibleStops = gamePack.stops.filter((stop) => !stop.isFinal);
+    await render(visibleStops, progressWithCurrentStop());
+
+    expect(mapState.easeTo).toHaveBeenCalledWith(expect.objectContaining({ zoom: 16.5 }));
+    expect(mapState.fitBounds).toHaveBeenCalled();
+    expect(mapState.getSource).toHaveBeenCalledWith('route-accuracy');
+    expect(container.querySelector('[data-testid="route-gps-marker"]')).not.toBeNull();
+
+    const centerButton = container.querySelector<HTMLButtonElement>('button[aria-label="Centreer op mijn locatie"]');
+    expect(centerButton).not.toBeNull();
+    expect(centerButton?.textContent?.trim()).toBe('');
+    expect(centerButton?.getAttribute('aria-pressed')).toBe('true');
+    await act(async () => centerButton?.click());
+    expect(mapState.easeTo).toHaveBeenCalledWith({ center: [5.3, 51.69], zoom: 16.5, duration: 300 });
+    expect(container.querySelector('a[href*="maps"]')).toBeNull();
+  });
+
+  it('keeps map instance stable when visibleStops gets a new equal array', async () => {
+    const visibleStops = gamePack.stops.filter((stop) => !stop.isFinal);
+    await render(visibleStops, progressWithCurrentStop());
+    expect(mapState.addSource.mock.calls.length).toBe(3);
+    expect(mapState.addLayer.mock.calls.length).toBe(7);
+    const fits = mapState.fitBounds.mock.calls.length;
+    await render([...visibleStops], progressWithCurrentStop());
+    expect(mapState.addSource.mock.calls.length).toBe(3);
+    expect(mapState.addLayer.mock.calls.length).toBe(7);
+    expect(mapState.fitBounds.mock.calls.length).toBe(fits);
+  });
+
+  it('automatically selects the unfinished nearby schub over the next main route stop', async () => {
+    const progress = progressNearFinale();
+    const stops = [...gamePack.stops];
+    const atCitadel = { latitude: 51.695161, longitude: 5.302865, accuracy: 12, capturedAt: new Date().toISOString() };
+    await render(stops, progress, atCitadel);
+
+    const sheet = container.querySelector('.route-map-view > .route-bottom-sheet');
+    expect(sheet).not.toBeNull();
+    expect(sheet?.textContent).toContain('De Citadel');
+    expect(sheet?.textContent).toContain('Jullie zijn hier');
+    expect(sheet?.textContent).toContain('Open schubopdracht');
+    expect(sheet?.querySelector('a[href="/stop/bonus:citadel"]')).not.toBeNull();
+    expect(sheet?.closest('.interactive-route-map')).toBeNull();
+    // Automatische GPS-updates mogen de pagina niet spontaan verschuiven.
+    expect(Element.prototype.scrollIntoView).not.toHaveBeenCalled();
+    expect(progress.currentStopId).toBe('bossche-brouwers');
+  });
+
+  it('keeps Zoete Lieve Gerritje selected away from the corrected Halve Peer pin', async () => {
+    const progress = progressAtGerritje();
+    const stops = gamePack.stops.filter((stop) => !stop.isFinal);
+    const gerritje = gamePack.stops.find((stop) => stop.id === 'zoete-lieve-gerritje')!;
+    const halvePeer = gamePack.bonusLocations!.find((bonus) => bonus.id === 'bonus:halve-peer')!;
+    const atGerritje = {
+      latitude: gerritje.coordinates.latitude!, longitude: gerritje.coordinates.longitude!,
+      accuracy: 12, capturedAt: new Date().toISOString()
+    };
+    // Het exacte nieuwe punt ligt ~22 m van Gerritje; vermijd activering op de hoofdstop.
+    await render(stops, progress, atGerritje);
+    expect(container.querySelector('.route-bottom-sheet')?.textContent).toContain('Zoete Lieve Gerritje');
+    expect(container.querySelector('.route-bottom-sheet')?.textContent).not.toContain('De Halve Peer');
+    expect(nearestUnfinishedBonus(atGerritje, [halvePeer], progress, null, gerritje)).toBeNull();
+
+    // Beide eerdere foutieve kaartpunten mogen de schub niet activeren.
+    const atFormerWrongPin = { ...atGerritje, latitude: 51.689444, longitude: 5.299722 };
+    const atFormerMigrationPin = { ...atGerritje, latitude: 51.688846, longitude: 5.300058 };
+    expect(nearestUnfinishedBonus(atFormerWrongPin, [halvePeer], progress, null, gerritje)).toBeNull();
+    expect(nearestUnfinishedBonus(atFormerMigrationPin, [halvePeer], progress, null, gerritje)).toBeNull();
+    expect(nearestUnfinishedBonus({ ...atGerritje, accuracy: 20 }, [halvePeer], progress, null, gerritje)).toBeNull();
+
+    const midpoint = {
+      ...atGerritje,
+      latitude: (gerritje.coordinates.latitude! + halvePeer.coordinates.latitude!) / 2,
+      longitude: (gerritje.coordinates.longitude! + halvePeer.coordinates.longitude!) / 2,
+      accuracy: 25
+    };
+    await render(stops, progress, midpoint);
+    expect(container.querySelector('.route-bottom-sheet')?.textContent).toContain('Zoete Lieve Gerritje');
+  });
+
+  it('recognizes Halve Peer when GPS clearly favors it and keeps deliberate map choices', async () => {
+    const progress = progressAtGerritje();
+    const stops = gamePack.stops.filter((stop) => !stop.isFinal);
+    const gerritje = gamePack.stops.find((stop) => stop.id === 'zoete-lieve-gerritje')!;
+    const halvePeer = gamePack.bonusLocations!.find((bonus) => bonus.id === 'bonus:halve-peer')!;
+    const atPeer = {
+      latitude: halvePeer.coordinates.latitude!, longitude: halvePeer.coordinates.longitude!,
+      accuracy: 12, capturedAt: new Date().toISOString()
+    };
+    await render(stops, progress, atPeer);
+    expect(container.querySelector('.route-bottom-sheet')?.textContent).toContain('De Halve Peer');
+    expect(nearestUnfinishedBonus(atPeer, [halvePeer], progress, null, gerritje)).toBe(halvePeer.id);
+    // Dezelfde nauwkeurigheid volstaat niet om de dichtbije schub te onderscheiden.
+    expect(nearestUnfinishedBonus({ ...atPeer, accuracy: 22 }, [halvePeer], progress, null, gerritje)).toBeNull();
+
+    await act(async () => {
+      (container.querySelector('[data-testid="map-select-zoete-lieve-gerritje"]') as HTMLButtonElement).click();
+    });
+    expect(container.querySelector('.route-bottom-sheet')?.textContent).toContain('Zoete Lieve Gerritje');
+
+    // Ook na opnieuw herkennen van de schub blijft de bewuste selectie staan.
+    await render(stops, progress, {
+      ...atPeer, latitude: gerritje.coordinates.latitude!, longitude: gerritje.coordinates.longitude!
+    });
+    await render(stops, progress, { ...atPeer, longitude: atPeer.longitude + 0.00001 });
+    expect(container.querySelector('.route-bottom-sheet')?.textContent).toContain('Zoete Lieve Gerritje');
+  });
+
+  it('opens an in-map popup for tapped route points and schubben, while respecting manual choices', async () => {
+    const progress = progressNearFinale();
+    const stops = [...gamePack.stops];
+    const gps = { latitude: 51.695161, longitude: 5.302865, accuracy: 12, capturedAt: new Date().toISOString() };
+    await render(stops, progress, gps);
+
+    await act(async () => {
+      (container.querySelector('[data-testid="map-select-bossche-brouwers"]') as HTMLButtonElement).click();
+    });
+    const sheet = container.querySelector('.route-map-view > .route-bottom-sheet');
+    expect(sheet?.textContent).toContain('De Brouwcode');
+    expect(sheet?.querySelector('a[href="/stop/bossche-brouwers"]')).not.toBeNull();
+    expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'end' });
+
+    await render(stops, progress, { ...gps, latitude: gps.latitude + 0.00001 });
+    expect(container.querySelector('.route-bottom-sheet')?.textContent).toContain('De Brouwcode');
+
+    await act(async () => {
+      (container.querySelector('[data-testid="map-select-bonus:citadel"]') as HTMLButtonElement).click();
+    });
+    expect(container.querySelector('.route-bottom-sheet')?.textContent).toContain('De Citadel');
+    expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'end' });
+
+    await act(async () => {
+      (container.querySelector('[aria-label="Stopinformatie sluiten"]') as HTMLButtonElement).click();
+    });
+    expect(container.querySelector('.route-bottom-sheet')).toBeNull();
+    await render(stops, progress, { ...gps, longitude: gps.longitude + 0.00001 });
+    expect(container.querySelector('.route-bottom-sheet')).toBeNull();
+  });
+
+  it('pauses following on drag and resumes with the location control', async () => {
+    const stops = gamePack.stops.filter((stop) => !stop.isFinal);
+    const first = { latitude: 51.69, longitude: 5.302, accuracy: 12, capturedAt: new Date().toISOString() };
+    await render(stops, progressWithCurrentStop(), first);
+    const drag = mapState.on.mock.calls.find(([event]) => event === 'dragstart')![1];
+    await act(async () => drag());
+    mapState.easeTo.mockClear();
+    await render(stops, progressWithCurrentStop(), { ...first, longitude: 5.303 });
+    expect(mapState.easeTo).not.toHaveBeenCalled();
+    expect(container.textContent).toContain('Volgen gepauzeerd');
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Centreer op mijn locatie"]')?.click());
+    expect(mapState.easeTo).toHaveBeenCalledWith(expect.objectContaining({ center: [5.303, 51.69] }));
+  });
+
+  it('offers external navigation only after sustained deviation and clears it on stale GPS', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-11-02T12:00:00Z'));
+    const stops = gamePack.stops.filter((stop) => !stop.isFinal);
+    const progress = progressAtGerritje();
+    const fix = () => ({ latitude: 51.682, longitude: 5.32, accuracy: 12, capturedAt: new Date().toISOString() });
+    await render(stops, progress, fix());
+    expect(container.querySelector('a[href*="maps"]')).toBeNull();
+    for (let step = 0; step < 3; step += 1) {
+      await act(async () => vi.advanceTimersByTime(10_000));
+      await render(stops, progress, fix());
+    }
+    expect(container.textContent).toContain('Even de weg kwijt?');
+    expect(container.querySelector('a[href*="maps"]')?.textContent).toBe('Open wandelnavigatie');
+    expect(container.querySelector('a[href*="maps"]')?.getAttribute('href')).toContain(`${stops[1].coordinates.latitude},${stops[1].coordinates.longitude}`);
+    await act(async () => vi.advanceTimersByTime(16_000));
+    expect(container.querySelector('[data-testid="route-gps-marker"]')).toBeNull();
+    expect(container.querySelector('[aria-label="Navigatiehulp"]')).toBeNull();
+    expect(container.textContent).toContain('Locatie wordt bijgewerkt…');
+  });
+
+  it('keeps a dismissed warning closed for the same deviation episode', async () => {
+    vi.useFakeTimers();
+    const stops = gamePack.stops.filter((stop) => !stop.isFinal);
+    const progress = progressAtGerritje();
+    const fix = () => ({ latitude: 51.682, longitude: 5.32, accuracy: 12, capturedAt: new Date().toISOString() });
+    await render(stops, progress, fix());
+    for (let step = 0; step < 3; step += 1) {
+      await act(async () => vi.advanceTimersByTime(10_000));
+      await render(stops, progress, fix());
+    }
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Navigatiehulp sluiten"]')?.click());
+    await act(async () => vi.advanceTimersByTime(5_000));
+    await render(stops, progress, fix());
+    expect(container.querySelector('[aria-label="Navigatiehulp"]')).toBeNull();
+  });
+
+  it('suppresses deviation help while deliberately visiting a schub', async () => {
+    vi.useFakeTimers();
+    const progress = progressAtGerritje();
+    const stops = gamePack.stops.filter((stop) => !stop.isFinal);
+    const bonus = gamePack.bonusLocations![0];
+    const fix = () => ({ latitude: 51.682, longitude: 5.32, accuracy: 12, capturedAt: new Date().toISOString() });
+    await render(stops, progress, fix(), bonus.id);
+    for (let step = 0; step < 4; step += 1) {
+      await act(async () => vi.advanceTimersByTime(10_000));
+      await render(stops, progress, fix(), bonus.id);
+    }
+    expect(container.querySelector('[aria-label="Navigatiehulp"]')).toBeNull();
+    expect(container.querySelector('a[href*="maps"]')).toBeNull();
+  });
+
+  it('keeps ordinary GPS copy and empty status rows out of the space between map and stop', async () => {
+    const fix = { latitude: 51.689, longitude: 5.302, accuracy: 8, capturedAt: new Date().toISOString() };
+    await render(gamePack.stops.filter((stop) => !stop.isFinal), progressWithCurrentStop(), fix);
+    expect(container.textContent).not.toContain('Jij bent hier');
+    expect(container.textContent).not.toContain('Nauwkeurig tot ongeveer');
+    expect(container.querySelector('.map-location-message')).toBeNull();
+    const map = container.querySelector('.interactive-route-map')!;
+    expect(map.nextElementSibling?.classList.contains('route-bottom-sheet')).toBe(true);
+  });
+
+  it('shows necessary GPS warnings inside the map instead of between elements', async () => {
+    const fix = { latitude: 51.689, longitude: 5.302, accuracy: 80, capturedAt: new Date().toISOString() };
+    const stops = gamePack.stops.filter((stop) => !stop.isFinal);
+    await render(stops, progressWithCurrentStop(), fix);
+    expect(container.querySelector('.interactive-route-map [role="status"]')?.textContent).toContain('GPS is onnauwkeurig');
+    const error = { kind: 'permission-denied' as const, message: 'Geef toestemming voor locatie.' };
+    await render(stops, progressWithCurrentStop(), null, undefined, error);
+    expect(container.querySelector('.interactive-route-map [role="status"]')?.textContent).toBe(error.message);
+    expect(container.querySelector('.map-location-message')).toBeNull();
+  });
+
+  it('draws a dashed walking connector after leaving a completed schub', async () => {
+    const progress = progressAtGerritje();
+    progress.stopProgress['bonus:bolwerk-sint-jan'].state = 'completed';
+    const bonus = gamePack.bonusLocations![0];
+    const fix = { latitude: bonus.coordinates.latitude!, longitude: bonus.coordinates.longitude!, accuracy: 8, capturedAt: new Date().toISOString() };
+    await render(gamePack.stops.filter((stop) => !stop.isFinal), progress, fix);
+    expect(mapState.addLayer).toHaveBeenCalledWith(expect.objectContaining({
+      id: 'schub-connector', paint: expect.objectContaining({ 'line-dasharray': [2, 2] })
+    }));
+    expect(mapState.setConnectorData).toHaveBeenCalledWith(expect.objectContaining({
+      features: [expect.objectContaining({ properties: expect.objectContaining({ bonusId: bonus.id, legIndex: 0 }) })]
+    }));
+    expect(container.querySelectorAll('.route-bottom-sheet__actions a')).toHaveLength(1);
+  });
+
+  it('keeps the connector after leaving the schub and removes it upon rejoining the main route', async () => {
+    const progress = progressAtGerritje();
+    progress.stopProgress['bonus:bolwerk-sint-jan'].state = 'completed';
+    const bonus = gamePack.bonusLocations![0];
+    const stops = gamePack.stops.filter((stop) => !stop.isFinal);
+    const fix = { latitude: bonus.coordinates.latitude!, longitude: bonus.coordinates.longitude!, accuracy: 8, capturedAt: new Date().toISOString() };
+    await render(stops, progress, fix);
+    const initial = mapState.setConnectorData.mock.calls.at(-1)?.[0];
+    expect(initial.features[0].properties.bonusId).toBe(bonus.id);
+    mapState.setConnectorData.mockClear();
+    await render(stops, progress, { ...fix, latitude: 51.690322, longitude: 5.299194 });
+    expect(mapState.setConnectorData).not.toHaveBeenCalled();
+    await render(stops, progress, { ...fix, latitude: 51.692, longitude: 5.304 });
+    expect(mapState.setConnectorData).toHaveBeenLastCalledWith({ type: 'FeatureCollection', features: [] });
+  });
+
+  it('draws the same connector on the offline map without new controls', async () => {
+    vi.mocked(HTMLCanvasElement.prototype.getContext).mockReturnValue(null);
+    try {
+      const progress = progressAtGerritje();
+      progress.stopProgress['bonus:bolwerk-sint-jan'].state = 'completed';
+      const bonus = gamePack.bonusLocations![0];
+      await render(gamePack.stops.filter((stop) => !stop.isFinal), progress, {
+        latitude: bonus.coordinates.latitude!, longitude: bonus.coordinates.longitude!, accuracy: 8, capturedAt: new Date().toISOString()
+      });
+      expect(container.querySelector('polyline.fallback-route-map__connector')?.getAttribute('points')).toContain(',');
+      expect(container.querySelectorAll('.route-bottom-sheet__actions a')).toHaveLength(1);
+    } finally {
+      vi.mocked(HTMLCanvasElement.prototype.getContext).mockReturnValue({} as never);
+    }
+  });
+
+  it('moves the GPS marker on successive device updates without resetting the map', async () => {
+    const stops = gamePack.stops.filter((stop) => !stop.isFinal);
+    const first = { latitude: 51.689, longitude: 5.302, accuracy: 14, capturedAt: new Date().toISOString() };
+    await render(stops, progressWithCurrentStop(), first);
+
+    const marker = container.querySelector('[data-testid="route-gps-marker"]');
+    expect(marker?.getAttribute('aria-label')).toBe('Jouw actuele GPS-positie');
+    const previousPosition = marker?.getAttribute('style');
+    expect(previousPosition).toContain('left:');
+    const fitsBefore = mapState.fitBounds.mock.calls.length;
+    const addBefore = mapState.addSource.mock.calls.length;
+
+    // GPS is part of the initial camera bounds; its marker remains independently
+    // visible above stop markers and moves without another map.fitBounds.
+    const initialBounds = mapState.fitBounds.mock.calls.at(-1)?.[0] as { coordinates: number[][] };
+    expect(initialBounds.coordinates).toContainEqual([first.longitude, first.latitude]);
+
+    const second = { ...first, latitude: 51.691, longitude: 5.308, capturedAt: new Date().toISOString() };
+    await render(stops, progressWithCurrentStop(), second);
+    expect(container.querySelector('[data-testid="route-gps-marker"]')?.getAttribute('style')).not.toBe(previousPosition);
+    expect(mapState.project).toHaveBeenCalledWith([second.longitude, second.latitude]);
+    expect(mapState.fitBounds.mock.calls.length).toBe(fitsBefore);
+    expect(mapState.addSource.mock.calls.length).toBe(addBefore);
+    expect(mapState.easeTo).toHaveBeenCalledWith(expect.objectContaining({ zoom: 16.5 }));
+  });
+});
+
+describe('nearestUnfinishedBonus', () => {
+  const bonus = gamePack.bonusLocations!.find((item) => item.id === 'bonus:citadel')!;
+  const position = { latitude: bonus.coordinates.latitude!, longitude: bonus.coordinates.longitude!, accuracy: 12 };
+  it('selects a nearby visible bonus but not a completed or inaccurate one', () => {
+    const progress = progressNearFinale();
+    expect(nearestUnfinishedBonus(position, [bonus], progress)).toBe(bonus.id);
+    expect(nearestUnfinishedBonus({ ...position, accuracy: 300 }, [bonus], progress)).toBeNull();
+    progress.stopProgress[bonus.id].state = 'completed';
+    expect(nearestUnfinishedBonus(position, [bonus], progress)).toBeNull();
+  });
+  it('ignores imprecise GPS and gives stable hysteresis to a previously chosen schub', () => {
+    const progress = progressNearFinale();
+    expect(nearestUnfinishedBonus({ ...position, accuracy: 65 }, [bonus], progress)).toBeNull();
+    expect(nearestUnfinishedBonus({ ...position, accuracy: 65 }, [bonus], progress, bonus.id)).toBe(bonus.id);
+    const offCenter = { ...position, latitude: position.latitude + (bonus.coordinates.radiusMeters - 5) / 111_000 };
+    expect(nearestUnfinishedBonus(offCenter, [bonus], progress, null)).toBeNull();
+  });
+
+  it('does not switch for small GPS jitter at the edge of the schub', () => {
+    const progress = progressNearFinale();
+    const outside = { ...position, latitude: position.latitude + (bonus.coordinates.radiusMeters + 20) / 111_000 };
+    expect(nearestUnfinishedBonus(outside, [bonus], progress, null)).toBeNull();
+    expect(nearestUnfinishedBonus(outside, [bonus], progress, bonus.id)).toBe(bonus.id);
+  });
+});

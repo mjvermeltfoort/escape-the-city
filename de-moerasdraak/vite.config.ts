@@ -1,0 +1,77 @@
+import { defineConfig, loadEnv } from 'vite';
+import react from '@vitejs/plugin-react';
+import { VitePWA } from 'vite-plugin-pwa';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
+const { version: appVersion } = JSON.parse(
+  readFileSync(new URL('./package.json', import.meta.url), 'utf8')
+) as { version: string };
+
+export default defineConfig(({ mode }) => ({
+  base: loadEnv(mode, process.cwd()).VITE_PUBLIC_BASE_URL || '/',
+  define: {
+    __APP_VERSION__: JSON.stringify(appVersion)
+  },
+  plugins: [
+    react(),
+    VitePWA({
+      registerType: 'autoUpdate',
+      includeAssets: ['icons/*'],
+      manifest: false,
+      workbox: {
+        cacheId: `escape-the-city-v${appVersion}`,
+        cleanupOutdatedCaches: true,
+        globPatterns: ['**/*.{js,css,html,ico,png,jpg,svg,webp,geojson,woff2}'],
+        globIgnores: ['dashboard.html', 'assets/dashboard-*.{js,css}'],
+        navigateFallbackDenylist: [/\/dashboard\.html$/],
+        runtimeCaching: [
+          {
+            urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,
+            handler: 'StaleWhileRevalidate',
+            options: {
+              cacheName: 'moerasdraak-font-styles'
+            }
+          },
+          {
+            urlPattern: /^https:\/\/fonts\.gstatic\.com\/.*/i,
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'moerasdraak-font-files',
+              expiration: {
+                maxEntries: 12,
+                maxAgeSeconds: 60 * 60 * 24 * 365
+              }
+            }
+          },
+          {
+            urlPattern: /\/audio\/.*\.(?:mp3|wav)$/i,
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'moerasdraak-audio-v3',
+              cacheableResponse: {
+                statuses: [0, 200]
+              },
+              expiration: {
+                maxEntries: 64,
+                maxAgeSeconds: 60 * 60 * 24 * 365
+              }
+            }
+          },
+          {
+            urlPattern: ({ url }) => url.pathname.endsWith('.tsx'),
+            handler: 'NetworkOnly'
+          }
+        ]
+      }
+    })
+  ],
+  build: {
+    rollupOptions: {
+      input: {
+        index: resolve(import.meta.dirname, 'index.html'),
+        dashboard: resolve(import.meta.dirname, 'dashboard.html')
+      }
+    }
+  }
+}));

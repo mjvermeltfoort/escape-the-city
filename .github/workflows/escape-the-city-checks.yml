@@ -1,0 +1,98 @@
+name: Escape the City checks
+
+on:
+  pull_request:
+    paths:
+      - 'de-moerasdraak/**'
+      - '.github/workflows/escape-the-city-checks.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: city-checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    defaults:
+      run:
+        working-directory: de-moerasdraak
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Smoke tests must never connect to the production backend.
+      VITE_PUBLIC_BASE_URL: /de-moerasdraak/
+      VITE_SUPABASE_URL: https://smoke-test.supabase.co
+      VITE_SUPABASE_ANON_KEY: smoke-test-public-key
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: de-moerasdraak/.nvmrc
+          cache: npm
+          cache-dependency-path: de-moerasdraak/package-lock.json
+      - name: Install dependencies
+        id: dependencies
+        run: npm ci
+      - name: Check TypeScript
+        run: npm run lint
+      - name: Run unit tests
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        run: npm test
+      - name: Build production assets
+        id: build
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        run: npm run build
+      - uses: actions/setup-python@v6
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        with:
+          python-version: '3.11'
+      - name: Install browser test tooling
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          python -m pip install playwright==1.55.0
+          python -m playwright install --with-deps chromium
+      - name: Check browser startup
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python scripts/checks/browser-smoke.py
+      - name: Upload browser diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-smoke-diagnostics
+          path: de-moerasdraak/test-results/browser-smoke/
+          if-no-files-found: ignore
+
+  database:
+    defaults:
+      run:
+        working-directory: de-moerasdraak
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: local-test-only
+          POSTGRES_DB: cooldown_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: local-test-only
+      PGDATABASE: cooldown_test
+    steps:
+      - uses: actions/checkout@v6
+      - name: Test migrations, shared cooldown, concurrent submissions and team spacing
+        run: bash scripts/checks/test-wrong-answer-sql.sh
+      - name: Rebuild all migrations and verify spacing with actual RPCs
+        run: bash scripts/checks/test-spacing-rebuild.sh
