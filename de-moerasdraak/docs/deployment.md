@@ -8,4 +8,6 @@ Standaard draait de build vanaf `/`. Stel `VITE_PUBLIC_BASE_URL` in als je de ap
 
 1. Selecteer GitHub Actions onder **Settings → Pages → Source** in de nieuwe repository.
 2. Stel voor online synchronisatie de repositoryvariabelen `SUPABASE_URL` en `SUPABASE_PUBLISHABLE_KEY` in voor het aparte Supabase-project. Zie [Supabase instellen](supabase-setup.md).
-3. Start **Deploy De Moerasdraak to GitHub Pages** handmatig in Actions. De workflow bepaalt het basispad vanuit de Pages-instellingen en publiceert de app onder `/de-moerasdraak/` binnen die site.
+3. Een push naar `main` met wijzigingen aan De Moerasdraak, de startpagina of de deployworkflow start de publicatie. Je kunt **Deploy De Moerasdraak to GitHub Pages** ook handmatig starten onder **Actions**, bijvoorbeeld na een wijziging aan de repositoryvariabelen.
+
+De workflow bepaalt het basispad vanuit de Pages-instellingen. De startpagina verwijst door naar `de-moerasdraak/` binnen de site.
